@@ -18,6 +18,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
@@ -160,8 +162,16 @@ void killer(const std::string &dir, const std::string &log, uint64_t seed,
 void crash_recovery(const std::string &dir) {
   std::string log = dir + "/../crash-log";
   remove(log.c_str());
-  for (uint64_t round = 0; round < 20; round++)
+  for (uint64_t round = 0; round < 20; round++) {
     killer(dir, log, round, round % 2 == 0);
+    if (round == 0) // tear a line on purpose, so the cut below always matters
+      std::ofstream(log, std::ios::app) << "torn";
+    // a kill can land mid-line: cut the log back to whole lines, or the
+    // next round appends to the torn one
+    std::ifstream in(log);
+    std::string s(std::istreambuf_iterator<char>(in), {});
+    assert(truncate(log.c_str(), s.rfind('\n') + 1) == 0); // npos + 1 == 0
+  }
 
   auto cas = PackCas::open(dir);
   FILE *f = fopen(log.c_str(), "r");
