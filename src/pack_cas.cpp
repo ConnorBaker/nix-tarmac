@@ -16,9 +16,11 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -48,6 +50,14 @@ auto data_sync(int fd) -> int {
 #else
   return fdatasync(fd);
 #endif
+}
+
+// empty where the kernel exposes none; commit() then syncs
+auto boot_id() -> std::string {
+  std::ifstream in("/proc/sys/kernel/random/boot_id");
+  std::string id;
+  std::getline(in, id);
+  return id;
 }
 
 constexpr size_t kMapSize = 1UL << 40;
@@ -147,7 +157,8 @@ private:
 // commits or aborts an owned write txn; joins an open batch txn instead
 class WriteTxn {
 public:
-  WriteTxn(MDB_env *env, MDB_txn *wtxn) : owned_(wtxn == nullptr), txn_(wtxn) {
+  WriteTxn(MDB_env *env, MDB_txn *wtxn)
+      : env_(env), owned_(wtxn == nullptr), txn_(wtxn) {
     if (owned_) {
       begin_write(env, &txn_);
     }
@@ -166,11 +177,22 @@ public:
     if (owned_) {
       MDB_txn *txn = txn_;
       txn_ = nullptr;
-      mdb_check(mdb_txn_commit(txn), "txn_commit");
+      // no marker: under NOMETASYNC the commit flushes its pages before
+      // the meta page that points at them, so a system crash cannot tear
+      // it (lmdb.h); we hold the write txn, so no other commit sees this
+      unsigned flags = 0;
+      mdb_env_get_flags(env_, &flags);
+      mdb_env_set_flags(env_, MDB_NOSYNC, 0);
+      mdb_env_set_flags(env_, MDB_NOMETASYNC, 1);
+      const int res = mdb_txn_commit(txn);
+      mdb_env_set_flags(env_, MDB_NOMETASYNC, flags & MDB_NOMETASYNC);
+      mdb_env_set_flags(env_, MDB_NOSYNC, flags & MDB_NOSYNC);
+      mdb_check(res, "txn_commit");
     }
   }
 
 private:
+  MDB_env *env_;
   bool owned_;
   MDB_txn *txn_;
 };
@@ -294,6 +316,7 @@ struct PackCas::Impl {
   MDB_dbi blobs{};
   MDB_dbi meta{};
   int lock_fd = -1;
+  std::string boot = boot_id();
 
   std::mutex map_mu;
   std::shared_ptr<Mapping> cur;
@@ -450,17 +473,93 @@ struct PackCas::Impl {
     }
   }
 
-  void commit_batch() {
+  // a sync covers every process's earlier unsynced commits: they share
+  // the pack file and the index map
+  void commit_batch(bool durable) {
     auto mapping = current();
-    if (data_sync(mapping->pack_fd) < 0) {
-      sys_err("fdatasync pack");
+    try {
+      mark_unsynced();
+      // without a marker, the pack must be on disk before the index names it
+      if (boot.empty() && data_sync(mapping->pack_fd) < 0) {
+        sys_err("fdatasync pack");
+      }
+    } catch (...) {
+      abort_batch();
+      throw;
     }
-    mdb_check(mdb_txn_commit(wtxn), "txn_commit");
-    wtxn = nullptr;
-    mdb_check(mdb_env_sync(env, 1), "env_sync");
+    const int res = mdb_txn_commit(wtxn);
+    wtxn = nullptr; // freed by LMDB, committed or not
+    if (res != MDB_SUCCESS) {
+      abort_batch();
+      mdb_check(res, "txn_commit");
+    }
     committed_end = end;
     mapping->size = end;
+    if (durable) {
+      try {
+        sync_all();
+      } catch (...) {
+        unlock_writer();
+        throw;
+      }
+    }
     unlock_writer();
+  }
+
+  // under the writer mutex: no commit lands between the syncs and the
+  // marker's removal
+  void sync_all() {
+    const WriteTxn txn(env, nullptr);
+    if (data_sync(current()->pack_fd) < 0) {
+      sys_err("fdatasync pack");
+    }
+    mdb_check(mdb_env_sync(env, 1), "env_sync");
+    std::error_code err;
+    if (std::filesystem::remove(dir + "/unsynced", err)) {
+      sync_dir();
+    }
+  }
+
+  // an unclean shutdown may leave the index pointing at unwritten pages,
+  // so the marker is on disk before any unsynced commit; open() resets a
+  // cache whose marker names another boot
+  void mark_unsynced() const {
+    const std::string path = dir + "/unsynced";
+    std::ifstream marker(path);
+    if (std::string id; boot.empty() || (std::getline(marker, id) && id == boot)) {
+      return;
+    }
+    // a rename: the marker is never empty or partial
+    const std::string tmp = path + ".tmp";
+    const int fd = open_file(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
+    if (fd < 0) {
+      sys_err("open " + tmp);
+    }
+    try {
+      write_all(fd, boot);
+    } catch (...) {
+      close(fd);
+      throw;
+    }
+    const int res = fsync(fd);
+    close(fd);
+    if (res < 0 || std::rename(tmp.c_str(), path.c_str()) < 0) {
+      sys_err("write " + path);
+    }
+    sync_dir();
+  }
+
+  // fsync(2): a file's fsync does not make its directory entry durable
+  void sync_dir() const {
+    const int fd = open_file(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+      sys_err("open " + dir);
+    }
+    const int res = fsync(fd);
+    close(fd);
+    if (res < 0) {
+      sys_err("fsync " + dir);
+    }
   }
 
   void abort_batch() {
@@ -574,6 +673,14 @@ auto PackCas::open_once(const std::string &dir) -> std::unique_ptr<PackCas> {
   auto impl = std::make_unique<Impl>();
   impl->dir = dir;
   std::filesystem::create_directories(dir);
+  if (std::ifstream marker(dir + "/unsynced"); marker) {
+    std::string id;
+    std::getline(marker, id);
+    // empty: no commit followed, it waits for the marker's fsync
+    if (!id.empty() && id != boot_id()) {
+      throw CorruptError("unsynced writes lost by an unclean shutdown");
+    }
+  }
   const std::string idx_dir = dir + "/index";
   if (mkdir(idx_dir.c_str(), kDirMode) < 0 && errno != EEXIST) {
     sys_err("mkdir " + idx_dir);
@@ -582,8 +689,10 @@ auto PackCas::open_once(const std::string &dir) -> std::unique_ptr<PackCas> {
   mdb_check(mdb_env_create(&impl->env), "env_create");
   mdb_check(mdb_env_set_mapsize(impl->env, kIndexMapSize), "set_mapsize");
   mdb_check(mdb_env_set_maxdbs(impl->env, kNumDbs), "set_maxdbs");
+  // without a boot id there is no marker: every commit is ordered
+  const unsigned sync_flag = impl->boot.empty() ? MDB_NOMETASYNC : MDB_NOSYNC;
   mdb_check(mdb_env_open(impl->env, idx_dir.c_str(),
-                         MDB_NOSYNC | MDB_WRITEMAP | MDB_NOTLS, kFileMode),
+                         sync_flag | MDB_WRITEMAP | MDB_NOTLS, kFileMode),
             "env_open");
   MDB_txn *txn = nullptr;
   begin_write(impl->env, &txn);
@@ -706,8 +815,18 @@ auto PackCas::has(std::string_view hash) -> bool {
 }
 
 void PackCas::sync() {
+  if (impl_->wtxn == nullptr) {
+    if (access((impl_->dir + "/unsynced").c_str(), F_OK) != 0) {
+      return;
+    }
+    impl_->begin_batch();
+  }
+  impl_->commit_batch(true);
+}
+
+void PackCas::commit() {
   if (impl_->wtxn != nullptr) {
-    impl_->commit_batch();
+    impl_->commit_batch(impl_->boot.empty());
   }
 }
 
@@ -792,11 +911,18 @@ void PackCas::compact(const std::function<bool(std::string_view)> &live) {
 }
 
 void PackCas::meta_put(std::string_view key, std::string_view val) {
+  meta_put({{std::string(key), std::string(val)}});
+}
+
+void PackCas::meta_put(
+    const std::vector<std::pair<std::string, std::string>> &records) {
   auto &impl = *impl_;
   WriteTxn txn(impl.env, impl.batch_txn());
-  MDB_val mkey = to_val(key);
-  MDB_val mval = to_val(val);
-  mdb_check(mdb_put(txn.get(), impl.meta, &mkey, &mval, 0), "mdb_put meta");
+  for (const auto &[key, val] : records) {
+    MDB_val mkey = to_val(key);
+    MDB_val mval = to_val(val);
+    mdb_check(mdb_put(txn.get(), impl.meta, &mkey, &mval, 0), "mdb_put meta");
+  }
   txn.commit();
 }
 
@@ -815,12 +941,18 @@ auto PackCas::meta_get(std::string_view key, std::string &out) -> bool {
 }
 
 void PackCas::meta_del(std::string_view key) {
+  meta_del(std::vector<std::string>{std::string(key)});
+}
+
+void PackCas::meta_del(const std::vector<std::string> &keys) {
   auto &impl = *impl_;
   WriteTxn txn(impl.env, impl.batch_txn());
-  MDB_val mkey = to_val(key);
-  const int res = mdb_del(txn.get(), impl.meta, &mkey, nullptr);
-  if (res != MDB_NOTFOUND) {
-    mdb_check(res, "mdb_del meta");
+  for (const auto &key : keys) {
+    MDB_val mkey = to_val(key);
+    const int res = mdb_del(txn.get(), impl.meta, &mkey, nullptr);
+    if (res != MDB_NOTFOUND) {
+      mdb_check(res, "mdb_del meta");
+    }
   }
   txn.commit();
 }

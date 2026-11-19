@@ -523,7 +523,7 @@ void TreeStore::touchRoot(const std::string &root, bool tree) {
 
 TreeStore::~TreeStore() {
   try {
-    flush_touches();
+    sync();
   } catch (...) { // NOLINT(bugprone-empty-catch)
   }
 }
@@ -539,8 +539,12 @@ void TreeStore::flush_touches() {
     const std::scoped_lock lock(touch_mutex_);
     batch.swap(pending_touch_);
   }
+  std::vector<std::pair<std::string, std::string>> records;
   for (const auto &[key, stamp] : batch) {
-    cas_->meta_put(key, be64(stamp));
+    records.emplace_back(key, be64(stamp));
+  }
+  if (!records.empty()) {
+    cas_->meta_put(records);
   }
 }
 
@@ -553,8 +557,8 @@ auto TreeStore::expire_roots(std::string_view prefix, uint64_t now) -> size_t {
                     }
                     return true;
                   });
-  for (const auto &key : expired) {
-    cas_->meta_del(key);
+  if (!expired.empty()) {
+    cas_->meta_del(expired);
   }
   return expired.size();
 }
@@ -595,12 +599,12 @@ void TreeStore::maybeGc() {
     try {
       mark_live(root, live);
     } catch (const std::exception &) {
-      broken.push_back(root);
+      broken.push_back("R" + root);
     }
     return true;
   });
-  for (const auto &root : broken) {
-    cas_->meta_del("R" + root);
+  if (!broken.empty()) {
+    cas_->meta_del(broken);
   }
   cas_->meta_scan("B", [&](std::string_view key, std::string_view) -> bool {
     live.insert(std::string(key.substr(1)));

@@ -151,6 +151,10 @@ for v in $versions; do
     --plugin-files "$plugin" --eval-store "$evalstore")
 
   drv=$("$nixbin" eval "${common[@]}" --raw --expr "($buildexpr).drvPath")
+  [[ ! -e $work/evalstore-$v/unsynced ]] || {
+    echo "FAIL evalstore $v: exit left the writes unsynced" >&2
+    exit 1
+  }
   [[ -e $work/evalstore-$v/pack.0 ]] || {
     echo "FAIL evalstore $v: store not populated" >&2
     exit 1

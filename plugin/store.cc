@@ -429,7 +429,7 @@ struct TarmacStore : nix::Store {
     state->store.registerRoot(rec.root_id, rec.root_type == 'd');
     metaPut(kPathPrefix, info.path, rec.encode());
     // commit promptly, the writer flock blocks other eval workers
-    state->store.sync();
+    state->store.cas().commit();
   }
 
   void addToStore(const nix::ValidPathInfo &info, nix::Source &source,
@@ -492,7 +492,7 @@ struct TarmacStore : nix::Store {
       const auto id = state->store.putBlob(unparseDrv(*this, drv));
       state->store.registerRoot(id, false);
       metaPut(kDrvPrefix, drvPath, id);
-      state->store.sync();
+      state->store.cas().commit();
     }
     return drvPath;
   }
