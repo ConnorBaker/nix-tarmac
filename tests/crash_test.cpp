@@ -7,15 +7,72 @@
 #include <fcntl.h>
 #include <lmdb.h>
 #include <signal.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cassert>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
+
+#ifdef __linux__
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+
+// interposes liblmdb's msync, the marker's fsyncs and mdb_txn_commit to
+// count flushes, a directory's apart; an index flush, a directory fsync
+// and an index commit each note whether `watched` (the marker) exists
+static unsigned msyncs = 0;
+static unsigned fsyncs = 0;
+static unsigned dir_fsyncs = 0;
+static const char *watched = nullptr;
+static bool watched_at_msync = false;
+static bool watched_at_dir_fsync = false;
+static bool watched_at_commit = false;
+static bool fail_next_commit = false;
+static bool watched_exists() {
+  return watched != nullptr && access(watched, F_OK) == 0;
+}
+extern "C" __attribute__((visibility("default"))) int
+msync(void *addr, size_t len, int flags) {
+  if ((flags & MS_SYNC) != 0) {
+    msyncs++;
+    watched_at_msync = watched_exists();
+  }
+  return static_cast<int>(syscall(SYS_msync, addr, len, flags));
+}
+extern "C" __attribute__((visibility("default"))) int fsync(int fd) {
+  struct stat st {};
+  if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+    dir_fsyncs++;
+    watched_at_dir_fsync = watched_exists();
+  } else {
+    fsyncs++;
+  }
+  return static_cast<int>(syscall(SYS_fsync, fd));
+}
+// a failed commit frees its txn, as LMDB's own does
+extern "C" __attribute__((visibility("default"))) int
+mdb_txn_commit(MDB_txn *txn) {
+  static auto *const real = reinterpret_cast<int (*)(MDB_txn *)>(
+      dlsym(RTLD_NEXT, "mdb_txn_commit"));
+  watched_at_commit = watched_exists();
+  if (fail_next_commit) {
+    fail_next_commit = false;
+    mdb_txn_abort(txn);
+    return MDB_MAP_FULL;
+  }
+  return real(txn);
+}
+#endif
 
 namespace {
 
@@ -62,9 +119,10 @@ void concurrent_writers(const std::string &dir) {
   printf("concurrent writers ok\n");
 }
 
-// child appends the batch's hashes to the log only after sync() returned,
-// so everything in the log must survive a SIGKILL
-void killer(const std::string &dir, const std::string &log, uint64_t seed) {
+// child appends the batch's hashes to the log only after sync() or
+// commit() returned, so everything in the log must survive a SIGKILL
+void killer(const std::string &dir, const std::string &log, uint64_t seed,
+            bool durable) {
   pid_t pid = fork();
   assert(pid >= 0);
   if (pid == 0) {
@@ -80,7 +138,10 @@ void killer(const std::string &dir, const std::string &log, uint64_t seed) {
       data.resize(100 + rng() % 8000, 'x');
       batch.push_back(cas->put(data));
       if (batch.size() >= 25) {
-        cas->sync();
+        if (durable)
+          cas->sync();
+        else
+          cas->commit();
         for (auto &h : batch)
           fprintf(f, "%s\n", to_hex(h).c_str());
         fflush(f);
@@ -100,7 +161,7 @@ void crash_recovery(const std::string &dir) {
   std::string log = dir + "/../crash-log";
   remove(log.c_str());
   for (uint64_t round = 0; round < 20; round++)
-    killer(dir, log, round);
+    killer(dir, log, round, round % 2 == 0);
 
   auto cas = PackCas::open(dir);
   FILE *f = fopen(log.c_str(), "r");
@@ -115,7 +176,132 @@ void crash_recovery(const std::string &dir) {
   }
   fclose(f);
   assert(n > 0);
-  printf("crash recovery: %zu synced hashes survived 20 kills\n", n);
+  printf("crash recovery: %zu committed hashes survived 20 kills\n", n);
+}
+
+std::string first_line(const std::string &path) {
+  std::ifstream in(path);
+  std::string line;
+  std::getline(in, line);
+  return line;
+}
+
+// commit()'s marker names this boot until a sync(); open() keeps the
+// cache under an empty marker and empties it under another boot's
+void unsynced_marker(const std::string &dir) {
+  const std::string marker = dir + "/unsynced";
+  const std::string hash = blake3_hash("unsynced");
+  std::string out;
+  {
+    auto cas = PackCas::open(dir);
+    (void) cas->put("unsynced");
+#ifdef __linux__
+    const unsigned fsyncs_before = fsyncs;
+    const unsigned dir_fsyncs_before = dir_fsyncs;
+    watched = marker.c_str();
+#endif
+    cas->commit();
+    const std::string boot = first_line("/proc/sys/kernel/random/boot_id");
+    assert(first_line(marker) == boot);
+#ifdef __linux__
+    // the marker and its directory are on disk before the commit
+    assert(fsyncs == fsyncs_before + 1);
+    assert(dir_fsyncs == dir_fsyncs_before + 1);
+    assert(watched_at_dir_fsync);
+    assert(watched_at_commit);
+    watched_at_msync = false;
+    const unsigned msyncs_before_sync = msyncs;
+#endif
+    cas->sync();
+#ifdef __linux__
+    // the index was flushed, while the marker still stood
+    assert(msyncs > msyncs_before_sync);
+    assert(watched_at_msync);
+    watched = nullptr;
+#endif
+    assert(access(marker.c_str(), F_OK) != 0);
+    // a write outside a batch flushes the index once and needs no marker;
+    // the batch commits after it stay unflushed
+#ifdef __linux__
+    unsigned before = msyncs;
+#endif
+    cas->meta_put("k", "v");
+#ifdef __linux__
+    assert(msyncs == before + 1);
+#endif
+    cas->meta_del("k");
+    assert(access(marker.c_str(), F_OK) != 0);
+#ifdef __linux__
+    before = msyncs;
+#endif
+    (void) cas->put("after an owned commit");
+    cas->commit();
+#ifdef __linux__
+    assert(msyncs == before);
+#endif
+    cas->sync();
+    // a marker that cannot be written fails the commit and ends the batch
+    std::filesystem::create_directory(marker + ".tmp");
+    (void) cas->put("unmarked");
+    bool threw = false;
+    try {
+      cas->commit();
+    } catch (const std::exception &) {
+      threw = true;
+    }
+    assert(threw);
+    std::filesystem::remove(marker + ".tmp");
+    const int lock = open((dir + "/lock").c_str(), O_RDWR | O_CLOEXEC);
+    assert(lock >= 0);
+    assert(flock(lock, LOCK_EX | LOCK_NB) == 0);
+    close(lock);
+    assert(!cas->has(blake3_hash("unmarked")));
+#ifdef __linux__
+    // so does a failed index commit
+    fail_next_commit = true;
+    (void) cas->put("uncommitted");
+    threw = false;
+    try {
+      cas->commit();
+    } catch (const std::exception &) {
+      threw = true;
+    }
+    assert(threw);
+    const int lock2 = open((dir + "/lock").c_str(), O_RDWR | O_CLOEXEC);
+    assert(lock2 >= 0);
+    assert(flock(lock2, LOCK_EX | LOCK_NB) == 0);
+    close(lock2);
+    assert(!cas->has(blake3_hash("uncommitted")));
+#endif
+  }
+  // an empty marker (a writer killed before writing it) is rewritten
+  std::ofstream(marker).close();
+  {
+    auto cas = PackCas::open(dir);
+    assert(cas->get(hash, out));
+    (void) cas->put("over an empty marker");
+    cas->commit();
+    assert(first_line(marker) == first_line("/proc/sys/kernel/random/boot_id"));
+  }
+  std::ofstream(marker) << "another-boot\n";
+  assert(!PackCas::open(dir)->get(hash, out));
+  printf("unsynced marker ok\n");
+}
+
+// a flush of many touched roots is one write txn: one index flush
+void touch_flush(const std::string &dir) {
+  TreeStore store(PackCas::open(dir), std::chrono::hours(1),
+                  std::chrono::hours(1), std::chrono::nanoseconds(0));
+  for (unsigned i = 0; i < 50; i++)
+    store.registerRoot(blake3_hash("root " + std::to_string(i)), false);
+  for (unsigned i = 0; i < 50; i++)
+    store.touchRoot(blake3_hash("root " + std::to_string(i)), false);
+#ifdef __linux__
+  const unsigned before = msyncs;
+  store.sync();
+  assert(msyncs == before + 1);
+#endif
+  printf("touch flush ok\n");
 }
 
 } // namespace
@@ -125,7 +311,8 @@ void crash_recovery(const std::string &dir) {
 // filled its 32 GiB index map with 26.7 GiB of free pages it could not
 // reuse (MDB_MAP_FULL). After such a death, 5,000 writes must keep the
 // index's high-water page low: record writes (their own write txns) and
-// batches, each with its own dead reader.
+// batches, each with its own dead reader. The batches commit without a
+// sync: page reuse does not depend on flushing.
 template <typename Each>
 size_t pages_after_dead_reader(const std::string &dir, Each each) {
   const std::string index = dir + "/index";
@@ -168,7 +355,7 @@ void dead_reader_cleared(const std::string &root) {
   const size_t batches = pages_after_dead_reader(
       root + "/dead-reader-batches", [](PackCas &cas, const std::string &i) {
         (void)cas.put(i);
-        cas.sync();
+        cas.commit();
       });
   printf("dead reader: index high-water %zu pages after records, %zu after "
          "batches\n", records, batches);
@@ -182,5 +369,7 @@ int main(int argc, char **argv) {
   concurrent_writers(dir);
   crash_recovery(dir);
   dead_reader_cleared(dir);
+  unsynced_marker(dir + "/unsynced-test");
+  touch_flush(dir + "/touch-test");
   return 0;
 }

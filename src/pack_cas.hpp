@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 auto blake3_hash(std::string_view data) -> std::string;
 
@@ -37,14 +39,20 @@ public:
   [[nodiscard]] auto size(std::string_view hash, uint64_t &out) -> bool;
   [[nodiscard]] auto has(std::string_view hash) -> bool;
   void sync();
+  // like sync() but not durable: a process crash keeps the batch, an
+  // unclean shutdown before the next sync() empties the cache
+  void commit();
 
   auto pack_size() -> uint64_t;
   void compact(const std::function<bool(std::string_view)> &live);
 
   // separate dbi; writes join an open batch
   void meta_put(std::string_view key, std::string_view val);
+  // one write txn: outside a batch, a commit costs an index flush
+  void meta_put(const std::vector<std::pair<std::string, std::string>> &records);
   [[nodiscard]] auto meta_get(std::string_view key, std::string &out) -> bool;
   void meta_del(std::string_view key);
+  void meta_del(const std::vector<std::string> &keys);
   void meta_scan(
       std::string_view prefix,
       const std::function<bool(std::string_view, std::string_view)> &callback);
