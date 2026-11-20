@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <lmdb.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -50,6 +51,14 @@ static void (*before_nb_flock)() = nullptr;
 // run once, before and after the next index open
 static void (*before_env_open)() = nullptr;
 static void (*after_env_open)() = nullptr;
+// the next open(2) or openat(2) of a path ending so fails with
+// fail_open_errno
+static const char *fail_open_suffix = nullptr;
+static int fail_open_errno = 0;
+// the latest syslog(3) message
+static std::string logged;
+// the next mdb_dbi_open returns this instead, if nonzero
+static int fail_dbi_open_with = 0;
 static bool watched_exists() {
   return watched != nullptr && access(watched, F_OK) == 0;
 }
@@ -90,6 +99,68 @@ mdb_env_open(MDB_env *env, const char *path, unsigned flags, mdb_mode_t mode) {
     hook();
   }
   return res;
+}
+static int open_or_fail(int dir_fd, const char *path, int flags, va_list ap) {
+  const mode_t mode = (flags & (O_CREAT | O_TMPFILE)) != 0
+                          ? static_cast<mode_t>(va_arg(ap, int))
+                          : 0;
+  const size_t len = strlen(path);
+  if (const char *suffix = fail_open_suffix;
+      suffix != nullptr && len >= strlen(suffix) &&
+      strcmp(path + len - strlen(suffix), suffix) == 0) {
+    fail_open_suffix = nullptr;
+    errno = fail_open_errno;
+    return -1;
+  }
+  return static_cast<int>(syscall(SYS_openat, dir_fd, path, flags, mode));
+}
+// with _FILE_OFFSET_BITS=64, as meson builds, this defines open64
+extern "C" __attribute__((visibility("default"))) int open(const char *path,
+                                                           int flags, ...) {
+  va_list ap;
+  va_start(ap, flags);
+  const int fd = open_or_fail(AT_FDCWD, path, flags, ap);
+  va_end(ap);
+  return fd;
+}
+// likewise openat64
+extern "C" __attribute__((visibility("default"))) int
+openat(int dir_fd, const char *path, int flags, ...) {
+  va_list ap;
+  va_start(ap, flags);
+  const int fd = open_or_fail(dir_fd, path, flags, ap);
+  va_end(ap);
+  return fd;
+}
+static void log_message(const char *format, va_list ap) {
+  char buf[1024];
+  vsnprintf(buf, sizeof(buf), format, ap);
+  logged = buf;
+}
+extern "C" __attribute__((visibility("default"))) void
+syslog(int /*priority*/, const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  log_message(format, ap);
+  va_end(ap);
+}
+extern "C" __attribute__((visibility("default"))) void
+__syslog_chk(int /*priority*/, int /*flag*/, const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  log_message(format, ap);
+  va_end(ap);
+}
+extern "C" __attribute__((visibility("default"))) int
+mdb_dbi_open(MDB_txn *txn, const char *name, unsigned flags, MDB_dbi *dbi) {
+  static auto *const real =
+      reinterpret_cast<int (*)(MDB_txn *, const char *, unsigned, MDB_dbi *)>(
+          dlsym(RTLD_NEXT, "mdb_dbi_open"));
+  if (const int res = fail_dbi_open_with; res != 0) {
+    fail_dbi_open_with = 0;
+    return res;
+  }
+  return real(txn, name, flags, dbi);
 }
 // a failed commit frees its txn, as LMDB's own does
 extern "C" __attribute__((visibility("default"))) int
@@ -558,7 +629,7 @@ void replaced_cache(const std::string &dir) {
     assert(!"a stale writer's compaction failed");
   }
   // nor does its poison reset the new cache
-  stale->poison();
+  stale->poison("stale");
   {
     auto fresh = PackCas::open(dir);
     assert(reads_back(*fresh, "fresh"));
@@ -569,7 +640,7 @@ void replaced_cache(const std::string &dir) {
   // using names in the directory
   auto fresh = PackCas::open(dir);
   (void)fresh->put("held");
-  fresh->poison();
+  fresh->poison("held");
   int waiting[2];
   assert(pipe(waiting) == 0);
   const pid_t pid = fork();
@@ -866,6 +937,91 @@ void trailing_slash_reset(const std::string &dir) {
 }
 #endif
 
+#ifdef __linux__
+// open() resets the cache only for corruption, and says why; any other
+// error leaves it as it is
+void open_errors_keep_cache(const std::string &dir) {
+  {
+    auto cas = PackCas::open(dir);
+    (void)cas->put("kept");
+    cas->sync();
+  }
+  logged.clear();
+  fail_open_suffix = "lock";
+  fail_open_errno = EACCES;
+  bool threw = false;
+  try {
+    (void)PackCas::open(dir);
+  } catch (const std::system_error &err) {
+    threw = err.code().value() == EACCES;
+  }
+  assert(threw);
+  assert(logged.empty());
+  assert(reads_back(*PackCas::open(dir), "kept"));
+
+  std::ofstream(dir + "/unsynced") << "another boot\n";
+  (void)PackCas::open(dir);
+  assert(logged.find("unsynced writes lost by an unclean shutdown") !=
+         std::string::npos);
+  assert(!PackCas::open(dir)->has(blake3_hash("kept")));
+
+  // a poison names the corruption it found
+  {
+    auto cas = PackCas::open(dir);
+    (void)cas->put("kept");
+    cas->sync();
+    cas->poison("pack truncated");
+  }
+  logged.clear();
+  (void)PackCas::open(dir);
+  assert(logged.find("poisoned: pack truncated") != std::string::npos);
+  printf("open errors keep the cache ok\n");
+}
+
+// lmdb.h's corruption codes reset the cache; MDB_VERSION_MISMATCH, which
+// another LMDB build returns for a sound index, does not
+void lmdb_codes(const std::string &dir) {
+  for (const int code : {MDB_INVALID, MDB_CORRUPTED, MDB_PAGE_NOTFOUND}) {
+    {
+      auto cas = PackCas::open(dir);
+      (void)cas->put("kept");
+      cas->sync();
+    }
+    logged.clear();
+    fail_dbi_open_with = code;
+    try {
+      (void)PackCas::open(dir);
+    } catch (const std::exception &err) {
+      printf("lmdb codes: open failed: %s\n", err.what());
+      fflush(stdout);
+      assert(!"open() did not reset for a corruption code");
+    }
+    assert(logged.find(mdb_strerror(code)) != std::string::npos);
+    assert(!PackCas::open(dir)->has(blake3_hash("kept")));
+  }
+  {
+    auto cas = PackCas::open(dir);
+    (void)cas->put("kept");
+    cas->sync();
+  }
+  logged.clear();
+  fail_dbi_open_with = MDB_VERSION_MISMATCH;
+  bool threw = false;
+  try {
+    (void)PackCas::open(dir);
+  } catch (const CorruptError &) {
+  } catch (const std::runtime_error &err) {
+    // it never heals by itself: the error says what will
+    threw = std::string(err.what()).find("remove the cache directory") !=
+            std::string::npos;
+  }
+  assert(threw);
+  assert(logged.empty());
+  assert(reads_back(*PackCas::open(dir), "kept"));
+  printf("lmdb codes ok\n");
+}
+#endif
+
 int main(int argc, char **argv) {
   std::string dir = argc > 1 ? argv[1] : make_test_dir("packcas-crash-test");
   concurrent_writers(dir);
@@ -883,6 +1039,8 @@ int main(int argc, char **argv) {
   moved_aside_swept(dir + "/sweep-test");
   sweep_spares_others(dir + "/spare-test");
   trailing_slash_reset(dir + "/slash-test");
+  open_errors_keep_cache(dir + "/open-errors-test");
+  lmdb_codes(dir + "/lmdb-codes-test");
 #endif
   return 0;
 }

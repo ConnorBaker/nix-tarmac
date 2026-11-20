@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -39,7 +40,7 @@ struct Ctx {
     return PackCas::open(dir);
   }
 
-  void poison() { store.cas().poison(); }
+  void poison(std::string_view why) { store.cas().poison(why); }
 
   static auto defaultDir() -> std::string {
     return (nix::getCacheDir() / "tarmac").string();
