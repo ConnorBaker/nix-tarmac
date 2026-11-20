@@ -43,6 +43,9 @@ public:
   // unclean shutdown before the next sync() empties the cache
   void commit();
 
+  // the next open() resets the cache, unless it was replaced since
+  void poison();
+
   auto pack_size() -> uint64_t;
   void compact(const std::function<bool(std::string_view)> &live);
 
@@ -58,8 +61,11 @@ public:
       const std::function<bool(std::string_view, std::string_view)> &callback);
 
 private:
-  static auto open_once(const std::string &dir) -> std::unique_ptr<PackCas>;
+  static auto open_once(const std::string &dir, bool &reset)
+      -> std::unique_ptr<PackCas>;
   struct Impl;
+  static auto open_files(std::unique_ptr<Impl> impl, const std::string &dir)
+      -> std::unique_ptr<PackCas>;
   explicit PackCas(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 };

@@ -18,8 +18,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #ifdef __linux__
@@ -38,6 +41,15 @@ static bool watched_at_msync = false;
 static bool watched_at_dir_fsync = false;
 static bool watched_at_commit = false;
 static bool fail_next_commit = false;
+// runs once, before the next fsync of a regular file
+static void (*before_file_fsync)() = nullptr;
+// gets a byte when a non-blocking flock first finds the lock taken
+static int notify_lock_wait = -1;
+// runs once, before the next non-blocking flock
+static void (*before_nb_flock)() = nullptr;
+// run once, before and after the next index open
+static void (*before_env_open)() = nullptr;
+static void (*after_env_open)() = nullptr;
 static bool watched_exists() {
   return watched != nullptr && access(watched, F_OK) == 0;
 }
@@ -56,8 +68,28 @@ extern "C" __attribute__((visibility("default"))) int fsync(int fd) {
     watched_at_dir_fsync = watched_exists();
   } else {
     fsyncs++;
+    if (auto *hook = before_file_fsync) {
+      before_file_fsync = nullptr;
+      hook();
+    }
   }
   return static_cast<int>(syscall(SYS_fsync, fd));
+}
+extern "C" __attribute__((visibility("default"))) int
+mdb_env_open(MDB_env *env, const char *path, unsigned flags, mdb_mode_t mode) {
+  static auto *const real =
+      reinterpret_cast<int (*)(MDB_env *, const char *, unsigned, mdb_mode_t)>(
+          dlsym(RTLD_NEXT, "mdb_env_open"));
+  if (auto *hook = before_env_open) {
+    before_env_open = nullptr;
+    hook();
+  }
+  const int res = real(env, path, flags, mode);
+  if (auto *hook = after_env_open) {
+    after_env_open = nullptr;
+    hook();
+  }
+  return res;
 }
 // a failed commit frees its txn, as LMDB's own does
 extern "C" __attribute__((visibility("default"))) int
@@ -77,6 +109,10 @@ mdb_txn_commit(MDB_txn *txn) {
 // it lands between open()'s index read and its writer flock
 static const char *compact_first = nullptr;
 extern "C" __attribute__((visibility("default"))) int flock(int fd, int op) {
+  if (auto *hook = before_nb_flock; hook != nullptr && (op & LOCK_NB) != 0) {
+    before_nb_flock = nullptr;
+    hook();
+  }
   if ((op & LOCK_NB) != 0 && compact_first != nullptr) {
     const std::string dir = compact_first;
     compact_first = nullptr;
@@ -89,7 +125,13 @@ extern "C" __attribute__((visibility("default"))) int flock(int fd, int op) {
     assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) &&
            WEXITSTATUS(st) == 0);
   }
-  return static_cast<int>(syscall(SYS_flock, fd, op));
+  const int res = static_cast<int>(syscall(SYS_flock, fd, op));
+  if (res < 0 && errno == EWOULDBLOCK && notify_lock_wait >= 0) {
+    assert(write(notify_lock_wait, "w", 1) == 1);
+    close(notify_lock_wait);
+    notify_lock_wait = -1;
+  }
+  return res;
 }
 #endif
 
@@ -406,6 +448,424 @@ void dead_reader_cleared(const std::string &root) {
   assert(batches < 1024);
 }
 
+#ifdef __linux__
+// another process's open() resets a cache: it replaces the directory, lock
+// file included. A process holding the old cache flocks the old lock file,
+// which does not exclude the new cache's writers, so it must name nothing
+// in the directory: no marker, no marker removal, no poison, no pack.
+static std::string replaced;
+
+template <typename Body> void in_child(Body body) {
+  const pid_t pid = fork();
+  assert(pid >= 0);
+  if (pid == 0) {
+    before_file_fsync = nullptr;
+    body();
+    _exit(0);
+  }
+  int st;
+  assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
+// a retired pack reads as corrupt
+bool reads_back(PackCas &cas, const std::string &data) {
+  std::string out;
+  try {
+    return cas.get(blake3_hash(data), out) && out == data;
+  } catch (const CorruptError &) {
+    return false;
+  }
+}
+
+// an open that another process's reset lands in opens the new cache
+std::unique_ptr<PackCas> open_during_reset(const std::string &dir) {
+  try {
+    return PackCas::open(dir);
+  } catch (const std::exception &err) {
+    printf("open during a reset failed: %s\n", err.what());
+    fflush(stdout);
+    assert(!"an open during a reset failed");
+  }
+  return nullptr;
+}
+
+// another process resets the cache and compacts it to a new generation,
+// holding a blob only it has
+static std::string compacted;
+void reset_and_compact() {
+  compacted += "+";
+  in_child([] {
+    std::ofstream(replaced + "/unsynced") << "another boot\n";
+    auto cas = PackCas::open(replaced);
+    (void)cas->put(compacted);
+    cas->sync();
+    cas->compact([](std::string_view) { return true; });
+  });
+}
+
+// then flocks the replaced cache's lock file, as a writer of it would
+static int replaced_lock = -1;
+void reset_compact_and_hold() {
+  reset_and_compact();
+  assert(syscall(SYS_flock, replaced_lock, LOCK_EX) == 0);
+}
+
+// a writer of the new cache, its commit left unsynced
+void commit_fresh() {
+  in_child([] {
+    auto cas = PackCas::open(replaced);
+    (void)cas->put("fresh");
+    cas->commit();
+  });
+}
+
+void replaced_cache(const std::string &dir) {
+  replaced = dir;
+  const std::string marker = dir + "/unsynced";
+  const std::string boot = first_line("/proc/sys/kernel/random/boot_id");
+  auto stale = PackCas::open(dir);
+  (void)stale->put("stale");
+  stale->sync();
+  std::ofstream(marker) << "another boot\n";
+  in_child([&] { (void)PackCas::open(dir); });
+  assert(access(marker.c_str(), F_OK) != 0);
+
+  // the new cache's writer commits between the stale writer's marker
+  // write and its rename
+  before_file_fsync = commit_fresh;
+  (void)stale->put("stale, after the reset");
+  try {
+    stale->commit();
+  } catch (const std::exception &err) {
+    printf("replaced cache: stale commit failed: %s\n", err.what());
+    fflush(stdout);
+    assert(!"a stale writer's commit failed");
+  }
+  if (before_file_fsync != nullptr) {
+    before_file_fsync = nullptr;
+    commit_fresh();
+  }
+  assert(first_line(marker) == boot);
+  // the stale writer's sync does not unmark the new cache's commit
+  stale->sync();
+  assert(first_line(marker) == boot);
+  // nor does its compaction retire the new cache's pack, nor fail
+  try {
+    stale->compact([](std::string_view) { return true; });
+  } catch (const std::exception &err) {
+    printf("replaced cache: stale compaction failed: %s\n", err.what());
+    fflush(stdout);
+    assert(!"a stale writer's compaction failed");
+  }
+  // nor does its poison reset the new cache
+  stale->poison();
+  {
+    auto fresh = PackCas::open(dir);
+    assert(reads_back(*fresh, "fresh"));
+  }
+  stale.reset();
+
+  // a reset waits for the writer flock: a writer holding it may be
+  // using names in the directory
+  auto fresh = PackCas::open(dir);
+  (void)fresh->put("held");
+  fresh->poison();
+  int waiting[2];
+  assert(pipe(waiting) == 0);
+  const pid_t pid = fork();
+  assert(pid >= 0);
+  if (pid == 0) {
+    close(waiting[0]);
+    notify_lock_wait = waiting[1];
+    (void)PackCas::open(dir);
+    _exit(0);
+  }
+  close(waiting[1]);
+  char token = 0;
+  // EOF: the reset finished without waiting
+  assert(read(waiting[0], &token, 1) == 1);
+  close(waiting[0]);
+  assert(reads_back(*fresh, "fresh"));
+  fresh->commit();
+  int st;
+  assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+  assert(!PackCas::open(dir)->has(blake3_hash("fresh")));
+  fresh.reset();
+
+  // a reset between open()'s lock file and its flock: open() takes the
+  // new cache, without retiring its live pack
+  before_nb_flock = reset_and_compact;
+  auto during = open_during_reset(dir);
+  assert(before_nb_flock == nullptr);
+  assert(reads_back(*during, compacted));
+  during.reset();
+  assert(reads_back(*PackCas::open(dir), compacted));
+
+  // the same while a writer of the replaced cache holds its flock: open()
+  // skips the orphan cleanup, and checks once the cache's files are open
+  replaced_lock = open((dir + "/lock").c_str(), O_RDWR | O_CLOEXEC);
+  assert(replaced_lock >= 0);
+  before_nb_flock = reset_compact_and_hold;
+  auto unlocked = open_during_reset(dir);
+  close(replaced_lock);
+  assert(before_nb_flock == nullptr);
+  assert(reads_back(*unlocked, compacted));
+  unlocked.reset();
+
+  // a reset after open() opened the index: the index is the replaced
+  // cache's, so open() takes the new cache
+  after_env_open = reset_and_compact;
+  auto late = open_during_reset(dir);
+  assert(after_env_open == nullptr);
+  assert(reads_back(*late, compacted));
+  printf("replaced cache ok\n");
+}
+
+// a reset that moved the cache aside and has not yet removed it, while a
+// new cache already stands at dir: an open that opened the directory
+// before the move opens the new cache's index by name and would map the
+// moved cache's pack through its descriptor
+static std::string moved_aside;
+void move_aside_and_refill() {
+  assert(std::rename(replaced.c_str(), moved_aside.c_str()) == 0);
+  in_child([] {
+    auto cas = PackCas::open(replaced);
+    (void)cas->put("refilled");
+    cas->sync();
+  });
+}
+
+void index_and_pack_of_one_cache(const std::string &dir) {
+  replaced = dir;
+  moved_aside = dir + ".moved";
+  {
+    auto cas = PackCas::open(dir);
+    (void)cas->put("moved aside");
+    cas->sync();
+  }
+  before_env_open = move_aside_and_refill;
+  auto cas = open_during_reset(dir);
+  assert(before_env_open == nullptr);
+  assert(reads_back(*cas, "refilled"));
+  printf("index and pack of one cache ok\n");
+}
+
+// a reset that opened the lock file before another process's reset
+// replaced the cache: the new cache is not the one found broken, and the
+// old lock file's flock does not exclude its writers, so the reset leaves
+// it
+void reset_of_replaced_cache(const std::string &dir) {
+  replaced = dir;
+  {
+    auto first = PackCas::open(dir);
+    (void)first->put("old");
+    first->sync();
+  }
+  std::ofstream(dir + "/unsynced") << "another boot\n";
+  before_nb_flock = reset_and_compact;
+  auto after = open_during_reset(dir);
+  assert(before_nb_flock == nullptr);
+  assert(reads_back(*after, compacted));
+  printf("reset of a replaced cache ok\n");
+}
+
+// a process of the replaced cache needs a generation it had not mapped:
+// the new cache has a pack of that name, which it must neither read nor
+// write
+void stale_writer_new_pack(const std::string &dir) {
+  replaced = dir;
+  auto stale = PackCas::open(dir);
+  in_child([] {
+    auto cas = PackCas::open(replaced);
+    (void)cas->put("gen0");
+    cas->sync();
+    cas->compact([](std::string_view) { return true; });
+  });
+  in_child([] {
+    std::ofstream(replaced + "/unsynced") << "another boot\n";
+    auto cas = PackCas::open(replaced);
+    (void)cas->put("new0");
+    cas->sync();
+    cas->compact([](std::string_view) { return true; });
+  });
+  // the same offset in the new cache's pack holds "new0"
+  std::string out;
+  try {
+    if (stale->get(blake3_hash("gen0"), out)) {
+      assert(out == "gen0");
+    }
+  } catch (const std::runtime_error &) {
+  }
+  // its pack is gone with its directory: a write fails
+  const auto stale_put = [&](const char *data) {
+    try {
+      (void)stale->put(data);
+      stale->commit();
+    } catch (const std::system_error &err) {
+      assert(err.code().value() == ENOENT);
+    }
+  };
+  stale_put("stale-one");
+  in_child([] {
+    auto cas = PackCas::open(replaced);
+    (void)cas->put("fresh-two");
+    cas->sync();
+  });
+  stale_put("stale-two");
+  stale.reset();
+  assert(reads_back(*PackCas::open(dir), "fresh-two"));
+  printf("stale writer new pack ok\n");
+}
+
+// A reset's removal can fail part-way when an opener creates a file in the
+// directory meanwhile: openers create the lock file, the index and the pack
+// without the flock. Were the directory removed in place, it would then
+// survive with a new lock file, dir_is would stay true for processes
+// holding the old one, and their flock would no longer exclude its
+// writers. The hook opens the cache before the reset's last rmdir.
+static const char *remove_watch = nullptr;
+static void (*before_remove)() = nullptr;
+static bool remove_hook_fired = false;
+static void remove_hook(const char *path) {
+  if (before_remove == nullptr || remove_watch == nullptr) {
+    return;
+  }
+  // dir itself or a name it was moved to: dir.reset.*
+  const char *base = strrchr(remove_watch, '/');
+  const char *name = path;
+  if (const char *slash = strrchr(path, '/'); slash != nullptr) {
+    name = slash + 1;
+  }
+  const bool match =
+      base != nullptr && strncmp(name, base + 1, strlen(base + 1)) == 0;
+  if (match) {
+    auto *hook = before_remove;
+    before_remove = nullptr;
+    remove_hook_fired = true;
+    hook();
+  }
+}
+extern "C" __attribute__((visibility("default"))) int
+remove(const char *path) noexcept {
+  remove_hook(path);
+  static auto *const real =
+      reinterpret_cast<int (*)(const char *)>(dlsym(RTLD_NEXT, "remove"));
+  return real(path);
+}
+extern "C" __attribute__((visibility("default"))) int
+rmdir(const char *path) noexcept {
+  remove_hook(path);
+  return static_cast<int>(syscall(SYS_unlinkat, AT_FDCWD, path, AT_REMOVEDIR));
+}
+extern "C" __attribute__((visibility("default"))) int
+unlinkat(int dirfd, const char *path, int flags) noexcept {
+  if ((flags & AT_REMOVEDIR) != 0) {
+    remove_hook(path);
+  }
+  return static_cast<int>(syscall(SYS_unlinkat, dirfd, path, flags));
+}
+
+static std::string partial_dir;
+void open_during_remove() {
+  in_child([] { (void)PackCas::open(partial_dir); });
+}
+
+void partial_reset(const std::string &dir) {
+  replaced = dir;
+  partial_dir = dir;
+  auto stale = PackCas::open(dir);
+  (void)stale->put("stale");
+  stale->sync();
+  std::ofstream(dir + "/unsynced") << "another boot\n";
+  in_child([&] {
+    remove_watch = partial_dir.c_str();
+    before_remove = open_during_remove;
+    (void)PackCas::open(dir);
+    if (!remove_hook_fired) {
+      printf("partial reset: the remove hook never fired\n");
+      fflush(stdout);
+      _exit(2);
+    }
+  });
+  struct stat after{};
+  printf("partial reset: directory %s after the reset\n",
+         stat(dir.c_str(), &after) == 0 ? "survived" : "is gone");
+  fflush(stdout);
+  // a writer of the cache now at dir commits between the stale writer's
+  // marker write and its rename, as in replaced_cache
+  before_file_fsync = commit_fresh;
+  (void)stale->put("stale, after the reset");
+  try {
+    stale->commit();
+  } catch (const std::exception &err) {
+    printf("partial reset: stale commit failed: %s\n", err.what());
+    fflush(stdout);
+    assert(!"a stale writer's commit failed after a partial reset");
+  }
+  before_file_fsync = nullptr;
+  printf("partial reset ok\n");
+}
+
+// a cache a reset moved aside and never finished removing, as after a
+// kill between its rename and its removal: the next open removes it
+void moved_aside_swept(const std::string &dir) {
+  const std::string left = dir + ".reset.1.2";
+  std::filesystem::create_directories(left + "/index");
+  std::ofstream(left + "/pack.0") << "an 82 GB pack";
+  (void)PackCas::open(dir);
+  assert(access(left.c_str(), F_OK) != 0);
+  printf("moved aside swept ok\n");
+}
+
+// the sweep removes only what a reset names <base>.reset.<pid>.<time>,
+// and a symlink of that name without following it
+void sweep_spares_others(const std::string &dir) {
+  namespace fs = std::filesystem;
+  fs::create_directories(dir);
+  const std::string target = dir + "-target";
+  fs::create_directories(target);
+  std::ofstream(target + "/data") << "kept";
+  fs::create_directory_symlink(target, dir + ".reset.9.9");
+  for (const char *spared :
+       {".resetx", ".reset.notes", ".reset.1.x", ".reset.1", ".reset..2"}) {
+    fs::create_directories(dir + spared);
+  }
+  fs::create_directories(dir + "2.reset.1.2");
+  fs::create_directories("x" + fs::path(dir).filename().string());
+  (void)PackCas::open(dir);
+  struct stat st{};
+  assert(lstat((dir + ".reset.9.9").c_str(), &st) != 0);
+  assert(access((target + "/data").c_str(), F_OK) == 0);
+  for (const char *spared :
+       {".resetx", ".reset.notes", ".reset.1.x", ".reset.1", ".reset..2"}) {
+    assert(access((dir + spared).c_str(), F_OK) == 0);
+  }
+  assert(access((dir + "2.reset.1.2").c_str(), F_OK) == 0);
+  printf("sweep spares others ok\n");
+}
+
+// a cache named with a trailing slash, as a tarmac:// store URI's path
+// keeps it, still resets
+void trailing_slash_reset(const std::string &dir) {
+  const std::string slashed = dir + "/";
+  {
+    auto cas = PackCas::open(slashed);
+    (void)cas->put("x");
+    cas->sync();
+  }
+  std::ofstream(dir + "/unsynced") << "another boot\n";
+  try {
+    auto cas = PackCas::open(slashed);
+    assert(!cas->has(blake3_hash("x")));
+  } catch (const std::exception &err) {
+    printf("trailing slash: open failed: %s\n", err.what());
+    fflush(stdout);
+    assert(!"a reset of a cache named with a trailing slash failed");
+  }
+  printf("trailing slash ok\n");
+}
+#endif
+
 int main(int argc, char **argv) {
   std::string dir = argc > 1 ? argv[1] : make_test_dir("packcas-crash-test");
   concurrent_writers(dir);
@@ -415,6 +875,14 @@ int main(int argc, char **argv) {
   touch_flush(dir + "/touch-test");
 #ifdef __linux__
   compaction_during_open(dir + "/compact-test");
+  replaced_cache(dir + "/replaced-test");
+  index_and_pack_of_one_cache(dir + "/one-cache-test");
+  reset_of_replaced_cache(dir + "/replaced-reset-test");
+  stale_writer_new_pack(dir + "/stale-pack-test");
+  partial_reset(dir + "/partial-reset-test");
+  moved_aside_swept(dir + "/sweep-test");
+  sweep_spares_others(dir + "/spare-test");
+  trailing_slash_reset(dir + "/slash-test");
 #endif
   return 0;
 }

@@ -1,6 +1,7 @@
 #include "pack_cas.hpp"
 
 #include <blake3.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <lmdb.h>
 #include <lz4.h>
@@ -10,6 +11,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -308,6 +310,142 @@ auto open_file(const std::string &path, int flags) -> int {
   return ::open(path.c_str(), flags, kFileMode);
 }
 
+auto open_at(int dir_fd, const std::string &name, int flags) -> int {
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): openat(2) is variadic
+  return ::openat(dir_fd, name.c_str(), flags, kFileMode);
+}
+
+// open() met a lock file that dir no longer names: open the new cache
+struct ReplacedError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+void wait_flock(int lock_fd) {
+  for (std::chrono::milliseconds waited{0};; waited += kLockPoll) {
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
+      return;
+    }
+    if (errno != EWOULDBLOCK) {
+      sys_err("flock");
+    }
+    if (waited >= kLockTimeout) {
+      throw std::runtime_error("timed out waiting for the pack writer "
+                               "lock; is another process stuck?");
+    }
+    std::this_thread::sleep_for(kLockPoll);
+  }
+}
+
+// A cache is its directory: a reset removes it and the next open makes
+// another at the same path. A PackCas resolves every name through the
+// directory it opened, so a replaced cache's names fail with ENOENT
+// instead of naming the new cache's files; its lock file, too, is the old
+// one, which does not exclude the new cache's writers.
+// whether dir still names the directory we opened
+auto dir_is(int dir_fd, const std::string &dir) -> bool {
+  struct stat held{};
+  struct stat named{};
+  return fstat(dir_fd, &held) == 0 && stat(dir.c_str(), &named) == 0 &&
+         held.st_dev == named.st_dev && held.st_ino == named.st_ino;
+}
+
+// removes a cache a reset moved aside. Only processes of that cache
+// create files in it, and only until its directory is gone; what cannot be
+// removed is left under its own name, never at dir.
+void remove_moved(const std::string &moved) {
+  std::error_code err;
+  for (int attempt = 0; attempt < kMaxGenerationRetries; attempt++) {
+    std::filesystem::remove_all(moved, err);
+    if (!err) {
+      return;
+    }
+  }
+  fprintf(stderr, "nix-tarmac: could not remove the reset cache %s: %s\n",
+          moved.c_str(), err.message().c_str());
+}
+
+auto all_digits(std::string_view str) -> bool {
+  return !str.empty() && std::ranges::all_of(str, [](char chr) {
+    return chr >= '0' && chr <= '9';
+  });
+}
+
+// <base>.reset.<pid>.<time>, as reset_dir names what it moves aside
+auto is_moved(std::string_view name, const std::string &base) -> bool {
+  const std::string prefix = base + ".reset.";
+  if (!name.starts_with(prefix)) {
+    return false;
+  }
+  name.remove_prefix(prefix.size());
+  const auto dot = name.find('.');
+  return dot != std::string_view::npos && all_digits(name.substr(0, dot)) &&
+         all_digits(name.substr(dot + 1));
+}
+
+// removes what earlier resets moved aside and left: a process killed
+// between a reset's rename and the end of its removal, or a removal that
+// failed. Nothing opens these again, so removing them is always safe, and
+// idempotent with a reset removing one now.
+void sweep_moved(const std::string &dir) {
+  namespace fs = std::filesystem;
+  const fs::path path(dir);
+  const std::string base = path.filename().string();
+  std::error_code err;
+  for (fs::directory_iterator it(path.parent_path(), err), end;
+       !err && it != end; it.increment(err)) {
+    if (is_moved(it->path().filename().string(), base)) {
+      std::error_code ignored;
+      fs::remove_all(it->path(), ignored);
+    }
+  }
+}
+
+// one spelling of the directory: a reset renames dir to dir + ".reset.*",
+// which for "cache/" would name an entry inside the cache itself
+auto normal_dir(const std::string &dir) -> std::string {
+  auto path = std::filesystem::path(dir).lexically_normal();
+  if (path.has_parent_path() && path.filename().empty()) {
+    path = path.parent_path();
+  }
+  return path.string();
+}
+
+// Resets the cache open at dir_fd, the one found broken, under its writer
+// flock: a writer that found dir still naming its cache uses names in it
+// only while it holds that flock. If another reset replaced it meanwhile,
+// the cache now at dir was not found broken, and stays. The rename is
+// atomic, so dir never names a part-removed cache, and an open racing the
+// removal makes a new directory at dir instead of filling the old one.
+auto reset_dir(int dir_fd, const std::string &dir) -> bool {
+  const int lock_fd = open_at(dir_fd, "lock", O_RDWR | O_CREAT | O_CLOEXEC);
+  if (lock_fd < 0) {
+    if (errno == ENOENT) {
+      return false; // already removed
+    }
+    sys_err("open " + dir + "/lock");
+  }
+  bool reset = false;
+  try {
+    wait_flock(lock_fd);
+    if (dir_is(dir_fd, dir)) {
+      const std::string moved =
+          dir + ".reset." + std::to_string(getpid()) + "." +
+          std::to_string(
+              std::chrono::steady_clock::now().time_since_epoch().count());
+      if (std::rename(dir.c_str(), moved.c_str()) < 0) {
+        sys_err("rename " + dir);
+      }
+      reset = true;
+      remove_moved(moved);
+    }
+  } catch (...) {
+    close(lock_fd);
+    throw;
+  }
+  close(lock_fd);
+  return reset;
+}
+
 } // namespace
 
 struct PackCas::Impl {
@@ -315,8 +453,12 @@ struct PackCas::Impl {
   MDB_env *env = nullptr;
   MDB_dbi blobs{};
   MDB_dbi meta{};
+  int dir_fd = -1; // every name resolves here
   int lock_fd = -1;
   std::string boot = boot_id();
+  // whether dir still names our directory, as of our latest flock;
+  // otherwise dir is another cache, which our flock does not exclude
+  mutable bool owns_dir = true;
 
   std::mutex map_mu;
   std::shared_ptr<Mapping> cur;
@@ -352,13 +494,27 @@ struct PackCas::Impl {
     if (lock_fd >= 0) {
       close(lock_fd);
     }
+    if (dir_fd >= 0) {
+      close(dir_fd);
+    }
     if (env != nullptr) {
       mdb_env_close(env);
     }
   }
 
+  [[nodiscard]] static auto pack_name(uint64_t gen) -> std::string {
+    return std::string(kPackPrefix) + std::to_string(gen);
+  }
+
   [[nodiscard]] auto pack_path(uint64_t gen) const -> std::string {
-    return dir + "/" + std::string(kPackPrefix) + std::to_string(gen);
+    return dir + "/" + pack_name(gen);
+  }
+
+  // in our directory: a replaced cache's directory is gone, so this fails
+  // with ENOENT rather than open the new cache's file of that name
+  [[nodiscard]] auto open_in_dir(const std::string &name, int flags) const
+      -> int {
+    return open_at(dir_fd, name, flags);
   }
 
   [[nodiscard]] auto read_gen(MDB_txn *txn) const -> uint64_t {
@@ -388,7 +544,7 @@ struct PackCas::Impl {
     auto mapping = std::make_shared<Mapping>();
     mapping->gen = gen;
     const int flags = O_RDWR | O_CLOEXEC | (create ? O_CREAT : 0);
-    mapping->pack_fd = open_file(pack_path(gen), flags);
+    mapping->pack_fd = open_in_dir(pack_name(gen), flags);
     if (mapping->pack_fd < 0) {
       if (!create && errno == ENOENT) {
         return nullptr;
@@ -437,19 +593,8 @@ struct PackCas::Impl {
   }
 
   void lock_writer() const {
-    for (std::chrono::milliseconds waited{0};; waited += kLockPoll) {
-      if (flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
-        return;
-      }
-      if (errno != EWOULDBLOCK) {
-        sys_err("flock");
-      }
-      if (waited >= kLockTimeout) {
-        throw std::runtime_error("timed out waiting for the pack writer "
-                                 "lock; is another process stuck?");
-      }
-      std::this_thread::sleep_for(kLockPoll);
-    }
+    wait_flock(lock_fd);
+    owns_dir = dir_is(dir_fd, dir);
   }
 
   void unlock_writer() const { flock(lock_fd, LOCK_UN); }
@@ -514,8 +659,7 @@ struct PackCas::Impl {
       sys_err("fdatasync pack");
     }
     mdb_check(mdb_env_sync(env, 1), "env_sync");
-    std::error_code err;
-    if (std::filesystem::remove(dir + "/unsynced", err)) {
+    if (unlinkat(dir_fd, "unsynced", 0) == 0) {
       sync_dir();
     }
   }
@@ -526,12 +670,14 @@ struct PackCas::Impl {
   void mark_unsynced() const {
     const std::string path = dir + "/unsynced";
     std::ifstream marker(path);
-    if (std::string id; boot.empty() || (std::getline(marker, id) && id == boot)) {
+    if (std::string id;
+        boot.empty() || !owns_dir || (std::getline(marker, id) && id == boot)) {
       return;
     }
     // a rename: the marker is never empty or partial
     const std::string tmp = path + ".tmp";
-    const int fd = open_file(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
+    const int fd =
+        open_in_dir("unsynced.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
     if (fd < 0) {
       sys_err("open " + tmp);
     }
@@ -543,7 +689,7 @@ struct PackCas::Impl {
     }
     const int res = fsync(fd);
     close(fd);
-    if (res < 0 || std::rename(tmp.c_str(), path.c_str()) < 0) {
+    if (res < 0 || renameat(dir_fd, "unsynced.tmp", dir_fd, "unsynced") < 0) {
       sys_err("write " + path);
     }
     sync_dir();
@@ -551,13 +697,7 @@ struct PackCas::Impl {
 
   // fsync(2): a file's fsync does not make its directory entry durable
   void sync_dir() const {
-    const int fd = open_file(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0) {
-      sys_err("open " + dir);
-    }
-    const int res = fsync(fd);
-    close(fd);
-    if (res < 0) {
+    if (fsync(dir_fd) < 0) {
       sys_err("fsync " + dir);
     }
   }
@@ -634,9 +774,18 @@ struct PackCas::Impl {
 
   // only safe with the writer lock
   void cleanup_orphans(uint64_t live_gen) const {
-    namespace fs = std::filesystem;
-    for (const auto &entry : fs::directory_iterator(dir)) {
-      const auto name = entry.path().filename().string();
+    const int list_fd = dup(dir_fd);
+    if (list_fd < 0) {
+      sys_err("dup " + dir);
+    }
+    DIR *listing = fdopendir(list_fd);
+    if (listing == nullptr) {
+      close(list_fd);
+      sys_err("fdopendir " + dir);
+    }
+    rewinddir(listing);
+    while (const dirent *entry = readdir(listing)) {
+      const std::string name = entry->d_name;
       if (!name.starts_with(kPackPrefix)) {
         continue;
       }
@@ -649,9 +798,10 @@ struct PackCas::Impl {
         continue;
       }
       if (gen != live_gen) {
-        unlink(entry.path().c_str());
+        unlinkat(dir_fd, name.c_str(), 0);
       }
     }
+    closedir(listing);
   }
 };
 
@@ -659,20 +809,101 @@ PackCas::PackCas(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 PackCas::~PackCas() = default;
 
-auto PackCas::open(const std::string &dir) -> std::unique_ptr<PackCas> {
+auto PackCas::open(const std::string &spelled) -> std::unique_ptr<PackCas> {
+  const std::string dir = normal_dir(spelled);
+  sweep_moved(dir);
+  bool reset = false;
+  for (int attempt = 0; attempt < kMaxGenerationRetries; attempt++) {
+    try {
+      return open_once(dir, reset);
+    } catch (const ReplacedError &) {
+      continue;
+    }
+  }
+  throw std::runtime_error("cache replaced during every open");
+}
+
+// a rename: an open never sees a partial poison. A replaced cache's
+// directory is gone, so its poison never reaches the new cache.
+void PackCas::poison() {
+  auto &impl = *impl_;
+  const std::string tmp = "poison." + std::to_string(getpid()) + ".tmp";
+  const int fd =
+      impl.open_in_dir(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
+  if (fd < 0) {
+    return; // a replaced cache: nothing left to reset
+  }
   try {
-    return open_once(dir);
-  } catch (const std::exception &) {
-    std::error_code err;
-    std::filesystem::remove_all(dir, err);
-    return open_once(dir);
+    write_all(fd, "corrupt\n");
+  } catch (...) {
+    close(fd);
+    unlinkat(impl.dir_fd, tmp.c_str(), 0);
+    throw;
+  }
+  close(fd);
+  if (renameat(impl.dir_fd, tmp.c_str(), impl.dir_fd, "poison") < 0) {
+    unlinkat(impl.dir_fd, tmp.c_str(), 0);
   }
 }
 
-auto PackCas::open_once(const std::string &dir) -> std::unique_ptr<PackCas> {
+// throws ReplacedError for open() to open dir again: after it reset the
+// cache, or when another process replaced it
+auto PackCas::open_once(const std::string &dir, bool &reset)
+    -> std::unique_ptr<PackCas> {
   auto impl = std::make_unique<Impl>();
   impl->dir = dir;
   std::filesystem::create_directories(dir);
+  // first: every name below resolves through it, or through dir while dir
+  // still names it, so all the files opened belong to one cache
+  impl->dir_fd = open_file(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (impl->dir_fd < 0) {
+    sys_err("open " + dir);
+  }
+  const int opened = dup(impl->dir_fd);
+  if (opened < 0) {
+    sys_err("dup " + dir);
+  }
+  const auto close_opened = [&] { close(opened); };
+  if (faccessat(opened, "poison", F_OK, 0) == 0) {
+    try {
+      reset_dir(opened, dir);
+    } catch (...) {
+      close_opened();
+      throw;
+    }
+    close_opened();
+    throw ReplacedError("poisoned cache reset");
+  }
+  try {
+    auto cas = open_files(std::move(impl), dir);
+    close_opened();
+    return cas;
+  } catch (const ReplacedError &) {
+    close_opened();
+    throw;
+  } catch (const std::exception &) {
+    if (reset) {
+      close_opened();
+      throw;
+    }
+    // false if another process replaced the cache: open the new one
+    try {
+      reset = reset_dir(opened, dir);
+    } catch (...) {
+      close_opened();
+      throw;
+    }
+    close_opened();
+    throw ReplacedError("cache reset");
+  }
+}
+
+auto PackCas::open_files(std::unique_ptr<Impl> impl, const std::string &dir)
+    -> std::unique_ptr<PackCas> {
+  impl->lock_fd = impl->open_in_dir("lock", O_RDWR | O_CREAT | O_CLOEXEC);
+  if (impl->lock_fd < 0) {
+    sys_err("open " + dir + "/lock");
+  }
   if (std::ifstream marker(dir + "/unsynced"); marker) {
     std::string id;
     std::getline(marker, id);
@@ -708,12 +939,6 @@ auto PackCas::open_once(const std::string &dir) -> std::unique_ptr<PackCas> {
   }
   mdb_check(mdb_txn_commit(txn), "txn_commit");
 
-  const std::string lock = dir + "/lock";
-  impl->lock_fd = open_file(lock, O_RDWR | O_CREAT | O_CLOEXEC);
-  if (impl->lock_fd < 0) {
-    sys_err("open " + lock);
-  }
-
   if (flock(impl->lock_fd, LOCK_EX | LOCK_NB) == 0) {
     // a compaction may have retired `gen` before we took the flock
     const ReadTxn live(impl->env, nullptr);
@@ -724,7 +949,11 @@ auto PackCas::open_once(const std::string &dir) -> std::unique_ptr<PackCas> {
   if (!impl->mapping_for(gen, true)) {
     throw std::runtime_error("cannot map pack");
   }
-
+  // the index was opened by name and the pack through dir_fd: they are
+  // one cache's if dir still names dir_fd, as no reset moved it meanwhile
+  if (!dir_is(impl->dir_fd, dir)) {
+    throw ReplacedError("cache replaced during open");
+  }
   return std::unique_ptr<PackCas>(new PackCas(std::move(impl)));
 }
 
@@ -839,7 +1068,12 @@ void PackCas::compact(const std::function<bool(std::string_view)> &live) {
   auto &impl = *impl_;
   sync();
   impl.lock_writer();
+  if (!impl.owns_dir) {
+    impl.unlock_writer();
+    return;
+  }
   int new_fd = -1;
+  std::string new_name;
   std::string new_path;
   try {
     WriteTxn txn(impl.env, nullptr);
@@ -847,8 +1081,9 @@ void PackCas::compact(const std::function<bool(std::string_view)> &live) {
     auto mapping = impl.mapping_for(gen, true);
     mapping->size = mapping->file_size();
 
+    new_name = Impl::pack_name(gen + 1);
     new_path = impl.pack_path(gen + 1);
-    new_fd = open_file(new_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC);
+    new_fd = impl.open_in_dir(new_name, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC);
     if (new_fd < 0) {
       sys_err("open " + new_path);
     }
@@ -899,14 +1134,14 @@ void PackCas::compact(const std::function<bool(std::string_view)> &live) {
 
     close(new_fd);
     new_fd = -1;
-    unlink(impl.pack_path(gen).c_str());
+    unlinkat(impl.dir_fd, Impl::pack_name(gen).c_str(), 0);
     impl.mapping_for(gen + 1, true);
     impl.committed_end = impl.end = new_off;
     impl.unlock_writer();
   } catch (...) {
     if (new_fd >= 0) {
       close(new_fd);
-      unlink(new_path.c_str());
+      unlinkat(impl.dir_fd, new_name.c_str(), 0);
     }
     impl.unlock_writer();
     throw;
