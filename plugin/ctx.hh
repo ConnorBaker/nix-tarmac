@@ -12,7 +12,6 @@
 
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -36,14 +35,11 @@ struct Ctx {
 
   static auto openHealed(const std::string &dir) -> std::unique_ptr<PackCas> {
     std::error_code err;
-    if (std::filesystem::exists(dir + "/poison", err)) {
-      std::filesystem::remove_all(dir, err);
-    }
     std::filesystem::create_directories(dir, err);
     return PackCas::open(dir);
   }
 
-  void poison() const { std::ofstream(dir + "/poison") << "corrupt\n"; }
+  void poison() { store.cas().poison(); }
 
   static auto defaultDir() -> std::string {
     return (nix::getCacheDir() / "tarmac").string();
