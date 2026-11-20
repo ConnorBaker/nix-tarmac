@@ -715,6 +715,9 @@ auto PackCas::open_once(const std::string &dir) -> std::unique_ptr<PackCas> {
   }
 
   if (flock(impl->lock_fd, LOCK_EX | LOCK_NB) == 0) {
+    // a compaction may have retired `gen` before we took the flock
+    const ReadTxn live(impl->env, nullptr);
+    gen = impl->read_gen(live.get());
     impl->cleanup_orphans(gen);
     impl->unlock_writer();
   }
