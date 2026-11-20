@@ -73,6 +73,25 @@ mdb_txn_commit(MDB_txn *txn) {
   }
   return real(txn);
 }
+
+// the next non-blocking flock first compacts `compact_first` in a child:
+// it lands between open()'s index read and its writer flock
+static const char *compact_first = nullptr;
+extern "C" __attribute__((visibility("default"))) int flock(int fd, int op) {
+  if ((op & LOCK_NB) != 0 && compact_first != nullptr) {
+    const std::string dir = compact_first;
+    compact_first = nullptr;
+    const pid_t pid = fork();
+    if (pid == 0) {
+      PackCas::open(dir)->compact([](std::string_view) { return true; });
+      _exit(0);
+    }
+    int st;
+    assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) &&
+           WEXITSTATUS(st) == 0);
+  }
+  return static_cast<int>(syscall(SYS_flock, fd, op));
+}
 #endif
 
 namespace {
@@ -313,6 +332,29 @@ void touch_flush(const std::string &dir) {
   printf("touch flush ok\n");
 }
 
+#ifdef __linux__
+// open() removes other generations' packs: one a compaction made live
+// after open() read the index must stay, or the next write starts a new
+// pack at offset 0 under the entries that pointed into it
+void compaction_during_open(const std::string &dir) {
+  const std::string kept(50, 'k'), later(50, 'l'); // short: stored raw
+  {
+    auto cas = PackCas::open(dir);
+    (void)cas->put(kept);
+    cas->sync();
+  }
+  compact_first = dir.c_str();
+  auto cas = PackCas::open(dir);
+  assert(compact_first == nullptr);
+  (void)cas->put(later);
+  cas->sync();
+  std::string out;
+  assert(cas->get(blake3_hash(kept), out));
+  assert(out == kept);
+  printf("compaction during open ok\n");
+}
+#endif
+
 } // namespace
 
 // A process killed inside a read txn leaves its reader slot, and LMDB
@@ -380,5 +422,8 @@ int main(int argc, char **argv) {
   dead_reader_cleared(dir);
   unsynced_marker(dir + "/unsynced-test");
   touch_flush(dir + "/touch-test");
+#ifdef __linux__
+  compaction_during_open(dir + "/compact-test");
+#endif
   return 0;
 }
