@@ -43,8 +43,9 @@ public:
   // unclean shutdown before the next sync() empties the cache
   void commit();
 
-  // the next open() resets the cache, unless it was replaced since
-  void poison();
+  // the next open() resets the cache, unless it was replaced since, and
+  // reports `why`
+  void poison(std::string_view why);
 
   auto pack_size() -> uint64_t;
   void compact(const std::function<bool(std::string_view)> &live);
