@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -31,7 +32,7 @@ inline auto tarmac_entry_type(char type) -> nix::SourceAccessor::Type {
 
 class PackAccessor : public nix::SourceAccessor {
 public:
-  using CorruptHook = std::function<void()>;
+  using CorruptHook = std::function<void(std::string_view)>;
 
   PackAccessor(TreeStore &store, std::string root, CorruptHook on_corrupt = {})
       : store_(&store), root_(std::move(root)), walker_(store),
@@ -108,7 +109,7 @@ private:
       return func();
     } catch (const CorruptError &err) {
       if (on_corrupt_) {
-        on_corrupt_();
+        on_corrupt_(err.what());
       }
       throw nix::Error("tarmac cache is corrupt (%s)", err.what());
     }

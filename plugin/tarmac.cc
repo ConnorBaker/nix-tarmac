@@ -56,7 +56,7 @@ template <typename Func> auto healing(Func func) {
   try {
     return func();
   } catch (const CorruptError &err) {
-    Ctx::get()->poison();
+    Ctx::get()->poison(err.what());
     throw nix::Error("tarmac cache is corrupt (%s); it resets on the next run",
                      err.what());
   }
@@ -240,8 +240,8 @@ struct FastTarballInputScheme : nix::fetchers::InputScheme {
                 from_hex(nix::fetchers::getStrAttr(cached->value, "root")))) {
           cached.reset();
         }
-      } catch (const CorruptError &) {
-        ctx.poison();
+      } catch (const CorruptError &err) {
+        ctx.poison(err.what());
         cached.reset();
       }
     }
@@ -279,8 +279,9 @@ struct FastTarballInputScheme : nix::fetchers::InputScheme {
 
     std::string root = from_hex(nix::fetchers::getStrAttr(info, "root"));
     ctx.store.touchRoot(root);
-    auto accessor = nix::make_ref<PackAccessor>(ctx.store, std::move(root),
-                                                [] { Ctx::get()->poison(); });
+    auto accessor = nix::make_ref<PackAccessor>(
+        ctx.store, std::move(root),
+        [](std::string_view why) { Ctx::get()->poison(why); });
     accessor->setPathDisplay("«" + input.to_string() + "»");
     return {accessor, input};
   }

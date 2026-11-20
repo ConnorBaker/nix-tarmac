@@ -8,6 +8,8 @@
 
 #include <cassert>
 #include <cstdio>
+#include <exception>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -104,7 +106,13 @@ int main(int argc, char **argv) {
     std::string junk(4096, char(0x5a));
     assert(pwrite(fd, junk.data(), junk.size(), 0) > 0);
     close(fd);
-    auto cas = PackCas::open(dir3);
+    std::unique_ptr<PackCas> cas;
+    try {
+      cas = PackCas::open(dir3);
+    } catch (const std::exception &err) {
+      printf("open of a trashed index failed: %s\n", err.what());
+    }
+    assert(cas && "open() resets a trashed index");
     std::string h = cas->put("fresh start");
     std::string out;
     assert(cas->get(h, out) && out == "fresh start");

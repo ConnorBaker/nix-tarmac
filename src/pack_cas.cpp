@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -75,6 +76,7 @@ constexpr auto kLockPoll = std::chrono::milliseconds(50);
 // a compaction can retire a generation between index lookup and mapping
 constexpr int kMaxGenerationRetries = 8;
 constexpr size_t kMinCompressSize = 64;
+constexpr size_t kPoisonReasonMax = 4096;
 constexpr std::string_view kPackPrefix = "pack.";
 // mismatch wipes the cache; bump when IndexEntry or the pack encoding changes
 constexpr std::string_view kFormat = "2";
@@ -83,7 +85,20 @@ constexpr std::string_view kFormat = "2";
   throw std::system_error(errno, std::generic_category(), what);
 }
 
+// lmdb.h: "File is not a valid LMDB file", "Located page was wrong
+// type", "Requested page not found - this usually indicates corruption";
+// not MDB_VERSION_MISMATCH, which another LMDB build reading a sound
+// index also returns
 void mdb_check(int res, const char *what) {
+  if (res == MDB_INVALID || res == MDB_CORRUPTED || res == MDB_PAGE_NOTFOUND) {
+    throw CorruptError(std::string(what) + ": " + mdb_strerror(res));
+  }
+  if (res == MDB_VERSION_MISMATCH) {
+    throw std::runtime_error(
+        std::string(what) + ": " + mdb_strerror(res) +
+        " (the cache index was written by another LMDB build: use that "
+        "build, or remove the cache directory to start a new cache)");
+  }
   if (res != MDB_SUCCESS) {
     throw std::runtime_error(std::string(what) + ": " + mdb_strerror(res));
   }
@@ -349,6 +364,16 @@ auto dir_is(int dir_fd, const std::string &dir) -> bool {
          held.st_dev == named.st_dev && held.st_ino == named.st_ino;
 }
 
+// a reset drops the whole cache: say why, where the user and the journal
+// will see it
+void report_reset(const std::string &dir, const std::string &why) {
+  fprintf(stderr, "nix-tarmac: resetting the cache %s: %s\n", dir.c_str(),
+          why.c_str());
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): syslog(3) is variadic
+  syslog(LOG_WARNING, "nix-tarmac: resetting the cache %s: %s", dir.c_str(),
+         why.c_str());
+}
+
 // removes a cache a reset moved aside. Only processes of that cache
 // create files in it, and only until its directory is gone; what cannot be
 // removed is left under its own name, never at dir.
@@ -416,7 +441,9 @@ auto normal_dir(const std::string &dir) -> std::string {
 // the cache now at dir was not found broken, and stays. The rename is
 // atomic, so dir never names a part-removed cache, and an open racing the
 // removal makes a new directory at dir instead of filling the old one.
-auto reset_dir(int dir_fd, const std::string &dir) -> bool {
+// `why` is the corruption found.
+auto reset_dir(int dir_fd, const std::string &dir, const std::string &why)
+    -> bool {
   const int lock_fd = open_at(dir_fd, "lock", O_RDWR | O_CREAT | O_CLOEXEC);
   if (lock_fd < 0) {
     if (errno == ENOENT) {
@@ -436,6 +463,7 @@ auto reset_dir(int dir_fd, const std::string &dir) -> bool {
         sys_err("rename " + dir);
       }
       reset = true;
+      report_reset(dir, why);
       remove_moved(moved);
     }
   } catch (...) {
@@ -825,7 +853,7 @@ auto PackCas::open(const std::string &spelled) -> std::unique_ptr<PackCas> {
 
 // a rename: an open never sees a partial poison. A replaced cache's
 // directory is gone, so its poison never reaches the new cache.
-void PackCas::poison() {
+void PackCas::poison(std::string_view why) {
   auto &impl = *impl_;
   const std::string tmp = "poison." + std::to_string(getpid()) + ".tmp";
   const int fd =
@@ -834,7 +862,7 @@ void PackCas::poison() {
     return; // a replaced cache: nothing left to reset
   }
   try {
-    write_all(fd, "corrupt\n");
+    write_all(fd, std::string(why) + "\n");
   } catch (...) {
     close(fd);
     unlinkat(impl.dir_fd, tmp.c_str(), 0);
@@ -866,7 +894,16 @@ auto PackCas::open_once(const std::string &dir, bool &reset)
   const auto close_opened = [&] { close(opened); };
   if (faccessat(opened, "poison", F_OK, 0) == 0) {
     try {
-      reset_dir(opened, dir);
+      std::string why;
+      if (const int fd = open_at(opened, "poison", O_RDONLY | O_CLOEXEC);
+          fd >= 0) {
+        std::array<char, kPoisonReasonMax> buf{};
+        const ssize_t got = read(fd, buf.data(), buf.size());
+        close(fd);
+        why.assign(buf.data(), got > 0 ? static_cast<size_t>(got) : 0);
+        why = why.substr(0, why.find('\n'));
+      }
+      reset_dir(opened, dir, "poisoned: " + why);
     } catch (...) {
       close_opened();
       throw;
@@ -881,14 +918,24 @@ auto PackCas::open_once(const std::string &dir, bool &reset)
   } catch (const ReplacedError &) {
     close_opened();
     throw;
-  } catch (const std::exception &) {
-    if (reset) {
+  } catch (const std::exception &err) {
+    // a failure of a replaced cache's open, such as its pack's ENOENT, is
+    // not this cache's corruption and would propagate below: open the new
+    // cache instead
+    if (!dir_is(opened, dir)) {
+      close_opened();
+      throw ReplacedError("cache replaced during open");
+    }
+    // anything but corruption (EMFILE, EACCES, a lock timeout, another
+    // LMDB build) says nothing about the cache: it propagates and the
+    // cache stays
+    if (reset || dynamic_cast<const CorruptError *>(&err) == nullptr) {
       close_opened();
       throw;
     }
     // false if another process replaced the cache: open the new one
     try {
-      reset = reset_dir(opened, dir);
+      reset = reset_dir(opened, dir, err.what());
     } catch (...) {
       close_opened();
       throw;
