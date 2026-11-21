@@ -51,7 +51,8 @@ struct Ctx {
     static std::mutex mutex;
     static std::map<std::string, std::shared_ptr<Ctx>> instances;
     const std::scoped_lock lock(mutex);
-    auto &ctx = instances[dir];
+    // tarmac://<dir>/ and the fetcher's <dir> are one cache
+    auto &ctx = instances[PackCas::cache_key(dir)];
     if (!ctx) {
       ctx = std::make_shared<Ctx>(dir);
     }

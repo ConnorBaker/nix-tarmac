@@ -67,6 +67,10 @@
           inherit (scope) tests;
           inherit (scope) plugin-dispatcher;
         }
+        // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
+          # strace
+          inherit (scope) one-cache;
+        }
       );
 
       devShells = forAllSystems (

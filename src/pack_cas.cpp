@@ -425,16 +425,6 @@ void sweep_moved(const std::string &dir) {
   }
 }
 
-// one spelling of the directory: a reset renames dir to dir + ".reset.*",
-// which for "cache/" would name an entry inside the cache itself
-auto normal_dir(const std::string &dir) -> std::string {
-  auto path = std::filesystem::path(dir).lexically_normal();
-  if (path.has_parent_path() && path.filename().empty()) {
-    path = path.parent_path();
-  }
-  return path.string();
-}
-
 // Resets the cache open at dir_fd, the one found broken, under its writer
 // flock: a writer that found dir still naming its cache uses names in it
 // only while it holds that flock. If another reset replaced it meanwhile,
@@ -838,7 +828,9 @@ PackCas::PackCas(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 PackCas::~PackCas() = default;
 
 auto PackCas::open(const std::string &spelled) -> std::unique_ptr<PackCas> {
-  const std::string dir = normal_dir(spelled);
+  // the resolved directory: a reset renames it, so a symlink to the cache
+  // still names the cache after one, and so does its key
+  const std::string dir = cache_key(spelled);
   sweep_moved(dir);
   bool reset = false;
   for (int attempt = 0; attempt < kMaxGenerationRetries; attempt++) {
@@ -872,6 +864,11 @@ void PackCas::poison(std::string_view why) {
   if (renameat(impl.dir_fd, tmp.c_str(), impl.dir_fd, "poison") < 0) {
     unlinkat(impl.dir_fd, tmp.c_str(), 0);
   }
+}
+
+auto PackCas::cache_key(const std::string &dir) -> std::string {
+  std::filesystem::create_directories(dir);
+  return std::filesystem::canonical(dir).string();
 }
 
 // throws ReplacedError for open() to open dir again: after it reset the
