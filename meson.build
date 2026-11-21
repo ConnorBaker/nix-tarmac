@@ -45,12 +45,13 @@ executable('gc_bench', 'bench/gc_bench.cpp', dependencies: core_dep)
 # its budget of running time; meson's own timeout is off (0), since nixpkgs
 # turns it off anyway and it would count time the build spends frozen.
 # A budget is three times the slowest pass on record (all build logs to
-# 2026-11-21), rounded up to 100 s, and never under 300 s: model_test and
-# crash_test wait on the filesystem journal for each sync, and passed
-# after up to 1113 s and 323 s on a busy aarch64 builder; the rest, 8 s.
+# 2026-11-21), rounded up to 100 s, and never under 300 s: crash_test
+# waits on the filesystem journal for its syncs and passed after up to
+# 323 s on a busy aarch64 builder; the rest, model_test since it stopped
+# syncing, under 10 s.
 watchdog = executable('watchdog', 'tests/watchdog.cpp')
 test_budgets = {
-  'model_test': 3400,
+  'model_test': 300,
   'corrupt_test': 300,
   'nar_test': 300,
   'crash_test': 1000,
