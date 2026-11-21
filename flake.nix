@@ -68,8 +68,8 @@
           inherit (scope) plugin-dispatcher;
         }
         // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
-          # strace
-          inherit (scope) one-cache;
+          # Linux: strace, and the sandbox these scripts were run in
+          inherit (scope) one-cache after-reset;
 
           # The tests as the deploy builds them: nix-optimization's tarmac.nix
           # builds Tarmac with llvmPackages_22.stdenv (to match its Clang-built
