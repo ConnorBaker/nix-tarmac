@@ -290,7 +290,10 @@ struct TarmacStore : nix::Store {
     state->store.cas().meta_put(metaKey(prefix, path), val);
   }
 
-  // GC may have collected the record's objects, drop it then
+  // GC may have collected the record's objects, drop it then. A path
+  // found valid is checked after the lookup: a cache a reset replaced
+  // would name a path that no later process finds. (One found invalid
+  // there is written next, and the write fails.)
   auto pathRecord(const nix::StorePath &path) -> std::optional<PathRecord> {
     auto raw = metaGet(kPathPrefix, path);
     if (!raw) {
@@ -301,6 +304,7 @@ struct TarmacStore : nix::Store {
       state->store.cas().meta_del(metaKey(kPathPrefix, path));
       return std::nullopt;
     }
+    state->store.cas().check_live();
     state->store.touchRoot(rec.root_id, rec.root_type == 'd');
     return rec;
   }
@@ -315,6 +319,7 @@ struct TarmacStore : nix::Store {
       state->store.cas().meta_del(metaKey(kDrvPrefix, path));
       return std::nullopt;
     }
+    state->store.cas().check_live();
     state->store.touchRoot(*id, false);
     return text;
   }
@@ -402,6 +407,9 @@ struct TarmacStore : nix::Store {
       if (res) {
         break;
       }
+    }
+    if (res) {
+      state->store.cas().check_live();
     }
     return res;
   }

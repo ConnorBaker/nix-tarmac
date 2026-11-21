@@ -334,11 +334,6 @@ auto open_at(int dir_fd, const std::string &name, int flags) -> int {
   return ::openat(dir_fd, name.c_str(), flags, kFileMode);
 }
 
-// open() met a lock file that dir no longer names: open the new cache
-struct ReplacedError : std::runtime_error {
-  using std::runtime_error::runtime_error;
-};
-
 void wait_flock(int lock_fd) {
   for (std::chrono::milliseconds waited{0};; waited += kLockPoll) {
     if (flock(lock_fd, LOCK_EX | LOCK_NB) == 0) {
@@ -619,10 +614,27 @@ struct PackCas::Impl {
     owns_dir = dir_is(dir_fd, dir);
   }
 
+  [[nodiscard]] auto replaced() const -> ReplacedError {
+    return ReplacedError("the cache at " + dir +
+                         " was reset after this process opened it");
+  }
+
+  void check_live() const {
+    if (!dir_is(dir_fd, dir)) {
+      throw replaced();
+    }
+  }
+
   void unlock_writer() const { flock(lock_fd, LOCK_UN); }
 
   void begin_batch() {
     lock_writer();
+    // a reset needs this flock, so it falls between batches: a batch
+    // begun on our cache commits to it
+    if (!owns_dir) {
+      unlock_writer();
+      throw replaced();
+    }
     try {
       begin_write(env, &wtxn);
       writer_thread = std::this_thread::get_id();
@@ -700,7 +712,7 @@ struct PackCas::Impl {
     const std::string path = dir + "/unsynced";
     std::ifstream marker(path);
     if (std::string id;
-        boot.empty() || !owns_dir || (std::getline(marker, id) && id == boot)) {
+        boot.empty() || (std::getline(marker, id) && id == boot)) {
       return;
     }
     // a rename: the marker is never empty or partial
@@ -1103,7 +1115,8 @@ auto PackCas::has(std::string_view hash) -> bool {
 
 void PackCas::sync() {
   if (impl_->wtxn == nullptr) {
-    if (access((impl_->dir + "/unsynced").c_str(), F_OK) != 0) {
+    // our directory's marker: a replaced cache has none of its own to sync
+    if (faccessat(impl_->dir_fd, "unsynced", F_OK, 0) != 0) {
       return;
     }
     impl_->begin_batch();
@@ -1116,6 +1129,8 @@ void PackCas::commit() {
     impl_->commit_batch(impl_->boot.empty());
   }
 }
+
+void PackCas::check_live() const { impl_->check_live(); }
 
 auto PackCas::pack_size() -> uint64_t { return impl_->current()->file_size(); }
 
@@ -1212,6 +1227,7 @@ void PackCas::meta_put(std::string_view key, std::string_view val) {
 void PackCas::meta_put(
     const std::vector<std::pair<std::string, std::string>> &records) {
   auto &impl = *impl_;
+  const bool batched = impl.batch_txn() != nullptr;
   WriteTxn txn(impl.env, impl.batch_txn());
   for (const auto &[key, val] : records) {
     MDB_val mkey = to_val(key);
@@ -1219,6 +1235,11 @@ void PackCas::meta_put(
     mdb_check(mdb_put(txn.get(), impl.meta, &mkey, &mval, 0), "mdb_put meta");
   }
   txn.commit();
+  // outside a batch there is no flock to keep a reset out: say so if the
+  // records went to a replaced cache
+  if (!batched) {
+    impl.check_live();
+  }
 }
 
 auto PackCas::meta_get(std::string_view key, std::string &out) -> bool {
@@ -1241,6 +1262,7 @@ void PackCas::meta_del(std::string_view key) {
 
 void PackCas::meta_del(const std::vector<std::string> &keys) {
   auto &impl = *impl_;
+  const bool batched = impl.batch_txn() != nullptr;
   WriteTxn txn(impl.env, impl.batch_txn());
   for (const auto &key : keys) {
     MDB_val mkey = to_val(key);
@@ -1250,6 +1272,9 @@ void PackCas::meta_del(const std::vector<std::string> &keys) {
     }
   }
   txn.commit();
+  if (!batched) {
+    impl.check_live();
+  }
 }
 
 void PackCas::meta_scan(
