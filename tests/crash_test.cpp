@@ -309,6 +309,13 @@ __syslog_chk(int /*priority*/, int /*flag*/, const char *format, ...) {
   log_message(format, ap);
   va_end(ap);
 }
+// glibc's fortified syslog() forwards its arguments here, not to
+// __syslog_chk, where the compiler lacks __va_arg_pack but
+// __fortify_use_clang && defined __USE_MISC holds (bits/syslog.h): Clang
+extern "C" __attribute__((visibility("default"))) void
+__vsyslog_chk(int /*priority*/, int /*flag*/, const char *format, va_list ap) {
+  log_message(format, ap);
+}
 extern "C" __attribute__((visibility("default"))) int
 mdb_dbi_open(MDB_txn *txn, const char *name, unsigned flags, MDB_dbi *dbi) {
   static auto *const real =
