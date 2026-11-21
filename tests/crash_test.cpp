@@ -56,6 +56,11 @@ static int fail_file_fsync_with = 0;
 static int fail_dir_fsync_with = 0;
 static int fail_write_with = 0;
 static int fail_rename_with = 0;
+// the next fdatasync fails with this errno instead, if nonzero
+static int fail_fdatasync_with = 0;
+// the next msync(MS_SYNC), an index flush, fails with this errno instead,
+// if nonzero
+static int fail_msync_with = 0;
 // runs once, before the next fsync of a regular file
 static void (*before_file_fsync)() = nullptr;
 // gets a byte when a non-blocking flock first finds the lock taken
@@ -189,6 +194,11 @@ static void index_point(const char *event) {
   }
 }
 extern "C" __attribute__((visibility("default"))) int fdatasync(int fd) {
+  if (const int err = fail_fdatasync_with; err != 0) {
+    fail_fdatasync_with = 0;
+    errno = err;
+    return -1;
+  }
   const int res = static_cast<int>(syscall(SYS_fdatasync, fd));
   if (res == 0) {
     note_synced(fd);
@@ -215,6 +225,11 @@ static void note_unlink(int dir_fd, const char *path) {
 }
 extern "C" __attribute__((visibility("default"))) int
 msync(void *addr, size_t len, int flags) {
+  if (const int err = fail_msync_with; err != 0 && (flags & MS_SYNC) != 0) {
+    fail_msync_with = 0;
+    errno = err;
+    return -1;
+  }
   if ((flags & MS_SYNC) != 0) {
     msyncs++;
     watched_at_msync = watched_exists();
@@ -1584,6 +1599,195 @@ void poison_failures(const std::string &dir) {
   }
   printf("poison failures ok\n");
 }
+
+// A sync whose flush fails, of the pack or of the index: Linux reports a
+// failed writeback once and may drop the unwritten pages, so the next
+// sync succeeds and removes the marker over pages that never reached the
+// disk. The failed sync poisons the cache, so the next open resets it.
+void sync_flush_failure(const std::string &dir) {
+  auto run = [&](const std::string &sub, const char *what, auto inject,
+                 auto injected) {
+    const std::string cache = dir + "/" + sub;
+    {
+      auto cas = PackCas::open(cache);
+      (void)cas->put("flushed " + sub);
+      inject();
+      bool threw = false;
+      try {
+        cas->sync();
+      } catch (const std::runtime_error &err) {
+        threw = std::string(err.what()).starts_with(what);
+        if (!threw) {
+          printf("sync flush failure: %s: sync() threw %s\n", sub.c_str(),
+                 err.what());
+          fflush(stdout);
+        }
+      }
+      assert(threw && injected());
+      cas->sync();
+      assert(access((cache + "/unsynced").c_str(), F_OK) != 0);
+    }
+    logged.clear();
+    (void)PackCas::open(cache);
+    if (logged.find(std::string("poisoned: a sync's flush failed: ") + what) ==
+        std::string::npos) {
+      printf("sync flush failure: %s: the reopen logged \"%s\"\n",
+             sub.c_str(), logged.c_str());
+      fflush(stdout);
+      assert(!"the cache did not reset after a sync's failed flush");
+    }
+  };
+  run("index", "env_sync: ", [] { fail_env_sync_with = EIO; },
+      [] { return fail_env_sync_with == 0; });
+  run("pack", "fdatasync pack: ", [] { fail_fdatasync_with = EIO; },
+      [] { return fail_fdatasync_with == 0; });
+  printf("sync flush failure ok\n");
+}
+
+// A commit under MDB_NOMETASYNC flushes the index map, and so can be the
+// flush told of a failed writeback, as sync_all()'s can: a later sync
+// then removes the marker over earlier commits' pages that never reached
+// the disk. Each commit that flushes poisons the cache when its flush
+// fails, so the next open resets it; a commit that fails with an LMDB
+// code (MDB_MAP_FULL) resets nothing.
+static std::string other_writer_dir;
+void commit_flush_failure(const std::string &dir) {
+  auto check = [](bool held, const std::string &route, const char *what) {
+    if (!held) {
+      printf("commit flush failure: %s: %s\n", route.c_str(), what);
+      fflush(stdout);
+      assert(!"a commit's failed flush was mishandled");
+    }
+  };
+  auto fails = [&](const std::string &route, auto body) {
+    try {
+      body();
+    } catch (const std::runtime_error &err) {
+      if (std::string(err.what()).starts_with("txn_commit: ")) {
+        return true;
+      }
+      printf("commit flush failure: %s: threw %s\n", route.c_str(),
+             err.what());
+      fflush(stdout);
+    }
+    return false;
+  };
+  auto resets = [&](const std::string &cache) {
+    logged.clear();
+    (void)PackCas::open(cache);
+    return logged.find("poisoned: an index commit failed: ") !=
+           std::string::npos;
+  };
+  // an unsynced commit, then an owned meta commit whose flush fails, as
+  // another thread's meta_put or meta_del can land between a batch's
+  // commit and its sync_all(); then a sync that succeeds
+  auto meta = [&](const std::string &route, auto op) {
+    const std::string cache = dir + "/" + route;
+    {
+      auto cas = PackCas::open(cache);
+      cas->meta_put("key", "val");
+      (void)cas->put("unsynced " + route);
+      cas->commit();
+      fail_msync_with = EIO;
+      check(fails(route, [&] { op(*cas); }) && fail_msync_with == 0, route,
+            "the commit's flush did not fail");
+      cas->sync();
+      check(access((cache + "/unsynced").c_str(), F_OK) != 0, route,
+            "the marker stayed");
+    }
+    check(resets(cache), route, "the next open did not reset");
+  };
+  meta("meta_put", [](PackCas &cas) { cas.meta_put("key", "other"); });
+  meta("meta_del", [](PackCas &cas) { cas.meta_del("key"); });
+
+  // compact(): another process's unsynced commit lands between its
+  // leading sync() and its writer lock
+  {
+    const std::string cache = dir + "/compact";
+    {
+      auto cas = PackCas::open(cache);
+      (void)cas->put("compacted");
+      cas->sync();
+      other_writer_dir = cache;
+      before_nb_flock = [] {
+        const pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+          auto other = PackCas::open(other_writer_dir);
+          (void)other->put("the other process's");
+          other->commit();
+          _exit(0);
+        }
+        int st;
+        assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) &&
+               WEXITSTATUS(st) == 0);
+        fail_msync_with = EIO;
+      };
+      const bool failed = fails("compact", [&] {
+        cas->compact([](std::string_view) { return true; });
+      });
+      check(failed && before_nb_flock == nullptr && fail_msync_with == 0,
+            "compact", "the commit's flush did not fail");
+      cas->sync();
+      check(access((cache + "/unsynced").c_str(), F_OK) != 0, "compact",
+            "the marker stayed");
+    }
+    check(resets(cache), "compact", "the next open did not reset");
+  }
+
+  // without a boot id every commit flushes, a batch's too: the earlier
+  // commit's meta page is unsynced until the next commit's flush
+  {
+    const std::string cache = dir + "/bootless";
+    hide_boot_id = true;
+    {
+      auto cas = PackCas::open(cache);
+      (void)cas->put("bootless one");
+      cas->commit();
+      (void)cas->put("bootless two");
+      fail_msync_with = EIO;
+      check(fails("batch", [&] { cas->commit(); }) && fail_msync_with == 0,
+            "batch", "the commit's flush did not fail");
+      (void)cas->put("bootless three");
+      cas->commit();
+    }
+    hide_boot_id = false;
+    check(resets(cache), "batch", "the next open did not reset");
+  }
+
+  // and so does an open's, which writes a new cache's format record
+  {
+    const std::string cache = dir + "/open";
+    hide_boot_id = true;
+    fail_msync_with = EIO;
+    check(fails("open", [&] { (void)PackCas::open(cache); }) &&
+              fail_msync_with == 0,
+          "open", "the commit's flush did not fail");
+    hide_boot_id = false;
+    check(resets(cache), "open", "the next open did not reset");
+  }
+
+  // a commit that fails with an LMDB code flushed nothing
+  {
+    const std::string cache = dir + "/map-full";
+    {
+      auto cas = PackCas::open(cache);
+      (void)cas->put("map full");
+      cas->commit();
+      fail_next_commit = true;
+      check(fails("map full", [&] { cas->meta_put("key", "val"); }) &&
+                !fail_next_commit,
+            "map full", "the commit did not fail");
+      cas->sync();
+    }
+    logged.clear();
+    (void)PackCas::open(cache);
+    check(logged.find("poisoned") == std::string::npos &&
+              access((cache + "/poison").c_str(), F_OK) != 0,
+          "map full", "the next open reset");
+  }
+  printf("commit flush failure ok\n");
+}
 #endif
 
 int main(int argc, char **argv) {
@@ -1613,6 +1817,8 @@ int main(int argc, char **argv) {
   compaction_flush_failure(dir + "/compact-flush-test");
   poison_durable(dir + "/poison-durable-test");
   poison_failures(dir + "/poison-failures-test");
+  sync_flush_failure(dir + "/sync-flush-test");
+  commit_flush_failure(dir + "/commit-flush-test");
 #endif
   return 0;
 }
