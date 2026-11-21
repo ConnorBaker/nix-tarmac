@@ -481,24 +481,32 @@ void concurrent_writers(const std::string &dir) {
 }
 
 // child appends the batch's hashes to the log only after sync() or
-// commit() returned, so everything in the log must survive a SIGKILL
+// commit() returned, so everything in the log must survive a SIGKILL.
+// The kill lands 2-62 ms after the child has logged `after` batches: with
+// none, anywhere from its open() on; with some, the log has them however
+// slowly the child runs, which a wall-clock delay alone never promised.
+constexpr unsigned kBatch = 25;
 void killer(const std::string &dir, const std::string &log, uint64_t seed,
-            bool durable) {
+            bool durable, unsigned after) {
+  int logged[2];
+  assert(pipe(logged) == 0);
   pid_t pid = fork();
   assert(pid >= 0);
   if (pid == 0) {
+    close(logged[0]);
     FILE *f = fopen(log.c_str(), "a");
     assert(f);
     auto cas = PackCas::open(dir);
     std::mt19937_64 rng(seed);
     std::vector<std::string> batch;
+    unsigned batches = 0;
     for (unsigned i = 0;; i++) {
       std::string data = "crash-" + std::to_string(seed) + "-" +
                          std::to_string(i) + "-" +
                          std::to_string(rng());
       data.resize(100 + rng() % 8000, 'x');
       batch.push_back(cas->put(data));
-      if (batch.size() >= 25) {
+      if (batch.size() >= kBatch) {
         if (durable)
           cas->sync();
         else
@@ -508,9 +516,20 @@ void killer(const std::string &dir, const std::string &log, uint64_t seed,
         fflush(f);
         assert(data_sync(fileno(f)) == 0);
         batch.clear();
+        if (batches < after) {
+          assert(write(logged[1], "b", 1) == 1);
+          batches++;
+        }
       }
     }
   }
+  close(logged[1]);
+  // a child that died first ends the pipe: read() returns 0
+  for (unsigned b = 0; b < after; b++) {
+    char c;
+    assert(read(logged[0], &c, 1) == 1);
+  }
+  close(logged[0]);
   std::mt19937_64 rng(seed ^ 0xdead);
   usleep(2000 + rng() % 60000);
   kill(pid, SIGKILL);
@@ -521,8 +540,12 @@ void killer(const std::string &dir, const std::string &log, uint64_t seed,
 void crash_recovery(const std::string &dir) {
   std::string log = dir + "/../crash-log";
   remove(log.c_str());
+  // every pairing of sync() or commit() with 0, 1 or 2 batches awaited
+  size_t awaited = 0;
   for (uint64_t round = 0; round < 20; round++) {
-    killer(dir, log, round, round % 2 == 0);
+    const unsigned after = round % 3;
+    killer(dir, log, round, round % 2 == 0, after);
+    awaited += kBatch * after;
     if (round == 0) // tear a line on purpose, so the cut below always matters
       std::ofstream(log, std::ios::app) << "torn";
     // a kill can land mid-line: cut the log back to whole lines, or the
@@ -544,7 +567,7 @@ void crash_recovery(const std::string &dir) {
     n++;
   }
   fclose(f);
-  assert(n > 0);
+  assert(n >= awaited);
   printf("crash recovery: %zu committed hashes survived 20 kills\n", n);
 }
 
