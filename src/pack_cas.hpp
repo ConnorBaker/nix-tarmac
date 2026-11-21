@@ -16,6 +16,13 @@ struct CorruptError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// The cache this PackCas opened is no longer at its path: a reset replaced
+// it. A write would land in the replaced cache, where no later process
+// finds it, and an answer from it may be untrue of the cache now there.
+struct ReplacedError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 // LMDB index (BLAKE3 -> offset/length) plus an append-only packfile read
 // through a shared mmap: lock-free reads from any process, writes batch
 // under an flock. Blobs are LZ4-compressed when that shrinks them; hashes
@@ -30,6 +37,10 @@ public:
   // for a bind mount of it at another path. LMDB forbids opening one
   // environment twice in a process, so a process keeps one PackCas per key.
   static auto cache_key(const std::string &dir) -> std::string;
+  // throws ReplacedError unless dir still names the cache this PackCas
+  // opened. A reset never undoes itself, so a check that passes after an
+  // operation shows the operation used the live cache.
+  void check_live() const;
   ~PackCas();
 
   PackCas(const PackCas &) = delete;
