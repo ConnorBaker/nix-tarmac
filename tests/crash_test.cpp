@@ -14,11 +14,13 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -59,14 +61,108 @@ static int fail_open_errno = 0;
 static std::string logged;
 // the next mdb_dbi_open returns this instead, if nonzero
 static int fail_dbi_open_with = 0;
+// while set, opening the boot id fails, as where /proc is missing
+// (macOS): boot_id() then comes back empty
+static bool hide_boot_id = false;
+static FILE *fopen_unless_boot_id(const char *name, const char *path,
+                                  const char *mode) {
+  if (hide_boot_id && strcmp(path, "/proc/sys/kernel/random/boot_id") == 0) {
+    errno = ENOENT;
+    return nullptr;
+  }
+  auto *real = reinterpret_cast<FILE *(*)(const char *, const char *)>(
+      dlsym(RTLD_NEXT, name));
+  return real(path, mode);
+}
+// boot_id()'s std::ifstream opens it through libstdc++'s fopen, which
+// under _FILE_OFFSET_BITS=64 may be spelled fopen64; each definition
+// names its symbol
+extern "C" __attribute__((visibility("default"))) FILE *
+fopen_hook(const char *path, const char *mode) __asm__("fopen");
+extern "C" FILE *fopen_hook(const char *path, const char *mode) {
+  return fopen_unless_boot_id("fopen", path, mode);
+}
+extern "C" __attribute__((visibility("default"))) FILE *
+fopen64_hook(const char *path, const char *mode) __asm__("fopen64");
+extern "C" FILE *fopen64_hook(const char *path, const char *mode) {
+  return fopen_unless_boot_id("fopen64", path, mode);
+}
 static bool watched_exists() {
   return watched != nullptr && access(watched, F_OK) == 0;
+}
+// fdatasync and a regular file's fsync record how much of the file a
+// system crash can no longer lose. While `durable_dir` names a cache, the
+// index's commits and flushes made without its marker, and the marker's
+// removal, each require every pack there to be on disk to its end; the
+// first pack that is not is described in `undurable`
+static std::map<std::pair<dev_t, ino_t>, off_t> synced_size;
+static const char *durable_dir = nullptr;
+static std::string undurable;
+static unsigned unmarked_index_points = 0;
+static unsigned marker_removals = 0;
+static void note_synced(int fd) {
+  struct stat st {};
+  if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+    synced_size[{st.st_dev, st.st_ino}] = st.st_size;
+  }
+}
+static void require_packs_on_disk(const char *event) {
+  for (const auto &entry : std::filesystem::directory_iterator(durable_dir)) {
+    const std::string name = entry.path().filename();
+    struct stat st {};
+    if (!name.starts_with("pack.") || stat(entry.path().c_str(), &st) != 0) {
+      continue;
+    }
+    const auto it = synced_size.find({st.st_dev, st.st_ino});
+    const off_t synced = it == synced_size.end() ? 0 : it->second;
+    if (st.st_size > synced && undurable.empty()) {
+      undurable = std::string(event) + ": " + name + " is " +
+                  std::to_string(st.st_size) + " bytes, " +
+                  std::to_string(synced) + " of them synced";
+    }
+  }
+}
+// an index commit or flush: unmarked, it may make durable entries that
+// name the pack
+static void index_point(const char *event) {
+  if (durable_dir != nullptr &&
+      access((std::string(durable_dir) + "/unsynced").c_str(), F_OK) != 0) {
+    unmarked_index_points++;
+    require_packs_on_disk(event);
+  }
+}
+extern "C" __attribute__((visibility("default"))) int fdatasync(int fd) {
+  const int res = static_cast<int>(syscall(SYS_fdatasync, fd));
+  if (res == 0) {
+    note_synced(fd);
+  }
+  return res;
+}
+// before unlinkat (below) removes a file: its inode may be reused by
+// the next pack
+static void note_unlink(int dir_fd, const char *path) {
+  struct stat st {};
+  if (fstatat(dir_fd, path, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+    synced_size.erase({st.st_dev, st.st_ino});
+  }
+  if (durable_dir != nullptr && strcmp(path, "unsynced") == 0) {
+    marker_removals++;
+    require_packs_on_disk("marker removal");
+  }
 }
 extern "C" __attribute__((visibility("default"))) int
 msync(void *addr, size_t len, int flags) {
   if ((flags & MS_SYNC) != 0) {
     msyncs++;
     watched_at_msync = watched_exists();
+    // mdb_env_sync (sync_all, compact) flushes the index by this msync
+    // alone, outside mdb_txn_commit: under MDB_WRITEMAP it is what
+    // guarantees an earlier NOSYNC or NOMETASYNC commit's meta page on
+    // disk. Today each such flush either runs under the marker
+    // (sync_all, which removes it after) or follows an unmarked commit
+    // the hook below checks (compact); this check holds for a flush
+    // that does neither
+    index_point("index flush");
   }
   return static_cast<int>(syscall(SYS_msync, addr, len, flags));
 }
@@ -82,7 +178,11 @@ extern "C" __attribute__((visibility("default"))) int fsync(int fd) {
       hook();
     }
   }
-  return static_cast<int>(syscall(SYS_fsync, fd));
+  const int res = static_cast<int>(syscall(SYS_fsync, fd));
+  if (res == 0) {
+    note_synced(fd);
+  }
+  return res;
 }
 extern "C" __attribute__((visibility("default"))) int
 mdb_env_open(MDB_env *env, const char *path, unsigned flags, mdb_mode_t mode) {
@@ -168,6 +268,7 @@ mdb_txn_commit(MDB_txn *txn) {
   static auto *const real = reinterpret_cast<int (*)(MDB_txn *)>(
       dlsym(RTLD_NEXT, "mdb_txn_commit"));
   watched_at_commit = watched_exists();
+  index_point("index commit");
   if (fail_next_commit) {
     fail_next_commit = false;
     mdb_txn_abort(txn);
@@ -832,6 +933,8 @@ extern "C" __attribute__((visibility("default"))) int
 unlinkat(int dirfd, const char *path, int flags) noexcept {
   if ((flags & AT_REMOVEDIR) != 0) {
     remove_hook(path);
+  } else {
+    note_unlink(dirfd, path);
   }
   return static_cast<int>(syscall(SYS_unlinkat, dirfd, path, flags));
 }
@@ -1082,6 +1185,99 @@ void lmdb_codes(const std::string &dir) {
 }
 #endif
 
+#ifdef __linux__
+// The index names a blob by its place in a pack, and get() returns those
+// bytes unchecked. A system crash keeps the pack's bytes only as far as
+// its last fdatasync (fdatasync(2)), and keeps nothing in order across
+// files, so an index that a crash keeps must name only synced pack bytes;
+// a crash would otherwise leave entries that read back zeros, and no
+// check that would reset the cache. Unsynced entries are allowed only
+// under the marker, which makes open() reset the cache after a crash.
+// So: a commit or flush of the index without the marker, and the
+// marker's removal, come after the pack's fdatasync. sync() removes the
+// marker; compact() commits the new pack's index without one.
+void pack_durable_before_index(const std::string &dir) {
+  synced_size.clear();
+  undurable.clear();
+  unmarked_index_points = marker_removals = 0;
+  auto blob = [](unsigned i) {
+    std::string b = "durable-" + std::to_string(i) + "-";
+    b.resize(2000, static_cast<char>('a' + i % 26));
+    return b;
+  };
+  {
+    auto cas = PackCas::open(dir);
+    durable_dir = dir.c_str();
+    for (unsigned i = 0; i < 20; i++) {
+      (void)cas->put(blob(i));
+    }
+    cas->commit();
+    cas->sync();
+    for (unsigned i = 20; i < 40; i++) {
+      (void)cas->put(blob(i));
+    }
+    cas->commit();
+    cas->compact([](std::string_view) { return true; });
+    (void)cas->put(blob(40));
+    cas->sync();
+    durable_dir = nullptr;
+  }
+  if (!undurable.empty()) {
+    printf("pack durable before index: %s\n", undurable.c_str());
+    fflush(stdout);
+  }
+  assert(undurable.empty());
+  // the checks ran: three syncs removed the marker, one of them
+  // compact()'s own, and the compaction committed and flushed the index
+  // without it
+  assert(marker_removals == 3);
+  assert(unmarked_index_points >= 2);
+  auto cas = PackCas::open(dir);
+  for (unsigned i = 0; i <= 40; i++) {
+    assert(reads_back(*cas, blob(i)));
+  }
+  printf("pack durable before index ok\n");
+}
+
+// Without a boot id (macOS has no /proc) there is no marker, so every
+// commit is synced (MDB_NOMETASYNC) and commit_batch() fdatasyncs the
+// pack before it
+void boot_id_less_commit(const std::string &dir) {
+  synced_size.clear();
+  undurable.clear();
+  unmarked_index_points = marker_removals = 0;
+  auto blob = [](unsigned i) {
+    std::string b = "bootless-" + std::to_string(i) + "-";
+    b.resize(2000, 'b');
+    return b;
+  };
+  hide_boot_id = true;
+  {
+    auto cas = PackCas::open(dir);
+    durable_dir = dir.c_str();
+    for (unsigned i = 0; i < 20; i++) {
+      (void)cas->put(blob(i));
+    }
+    cas->commit();
+    durable_dir = nullptr;
+    // the boot id was hidden: commit() wrote no marker
+    assert(access((dir + "/unsynced").c_str(), F_OK) != 0);
+  }
+  hide_boot_id = false;
+  if (!undurable.empty()) {
+    printf("boot-id-less commit: %s\n", undurable.c_str());
+    fflush(stdout);
+  }
+  assert(undurable.empty());
+  assert(unmarked_index_points >= 1);
+  auto cas = PackCas::open(dir);
+  for (unsigned i = 0; i < 20; i++) {
+    assert(reads_back(*cas, blob(i)));
+  }
+  printf("boot-id-less commit ok\n");
+}
+#endif
+
 int main(int argc, char **argv) {
   std::string dir = argc > 1 ? argv[1] : make_test_dir("packcas-crash-test");
   concurrent_writers(dir);
@@ -1104,6 +1300,8 @@ int main(int argc, char **argv) {
   symlinked_dir_reset(dir + "/symlink-test");
   open_errors_keep_cache(dir + "/open-errors-test");
   lmdb_codes(dir + "/lmdb-codes-test");
+  pack_durable_before_index(dir + "/durable-test");
+  boot_id_less_commit(dir + "/bootless-test");
 #endif
   return 0;
 }
