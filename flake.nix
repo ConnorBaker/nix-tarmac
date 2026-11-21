@@ -70,6 +70,19 @@
         // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
           # strace
           inherit (scope) one-cache;
+
+          # The tests as the deploy builds them: nix-optimization's tarmac.nix
+          # builds Tarmac with llvmPackages_22.stdenv (to match its Clang-built
+          # Nix libraries) and runs these tests. This pin mirrors that one by
+          # hand; nothing keeps the two in step. glibc's fortified headers
+          # route calls differently for Clang than for GCC (syslog() to
+          # __vsyslog_chk instead of __syslog_chk, <bits/syslog.h>), which the
+          # GCC-built tests above never exercise. glibc only: on Darwin there
+          # is no such split, and crash_test's open_errors_keep_cache is
+          # `#ifdef __linux__`.
+          tests-clang = scope.tests.override {
+            inherit (nixpkgs.legacyPackages.${system}.llvmPackages_22) stdenv;
+          };
         }
       );
 
