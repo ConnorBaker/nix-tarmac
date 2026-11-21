@@ -69,7 +69,7 @@
         }
         // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
           # Linux: strace, and the sandbox these scripts were run in
-          inherit (scope) one-cache after-reset;
+          inherit (scope) one-cache after-reset c-api-after-reset;
         }
       );
 

@@ -90,5 +90,11 @@ lib.makeScope newScope (
       nix = nixVersions.latest;
       plugin = self.default;
     };
+
+    # a C API client of a tarmac store refuses answers from a replaced cache
+    c-api-after-reset = self.callPackage ./tests/c-api-after-reset.nix {
+      nix = nixVersions.latest;
+      plugin = self.default;
+    };
   }
 )
