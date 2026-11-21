@@ -78,5 +78,11 @@ lib.makeScope newScope (
       };
 
     plugin-dispatcher = self.mkDispatcher [ ];
+
+    # one LMDB environment per cache in a process (plugin/ctx.hh)
+    one-cache = self.callPackage ./tests/one-cache.nix {
+      nix = nixVersions.latest;
+      plugin = self.default;
+    };
   }
 )

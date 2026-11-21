@@ -96,6 +96,12 @@ Eval records survive as long as something reads them. Pass an
 explicit path like `tarmac:///var/cache/evalstore` for an isolated
 store with its own retention.
 
+A process opens each cache once, however its path is spelled and
+through any symlink to it: the fetcher and a `tarmac://` store on the
+same directory share it. A bind mount of the directory at a second
+path is a second name for it, and a process using both paths opens the
+cache's LMDB environment twice, which LMDB does not support.
+
 ## Installation
 
 On NixOS, add the flake input and import the module:

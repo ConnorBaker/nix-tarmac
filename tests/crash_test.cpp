@@ -944,6 +944,66 @@ void trailing_slash_reset(const std::string &dir) {
   }
   printf("trailing slash ok\n");
 }
+
+// open() names the directory the kernel resolves: through a symlink,
+// link/../c is the symlink target's sibling, not dir/c
+void dotdot_through_symlink(const std::string &dir) {
+  namespace fs = std::filesystem;
+  fs::create_directories(dir + "/sub/real");
+  fs::create_directory_symlink(dir + "/sub/real", dir + "/link");
+  {
+    auto cas = PackCas::open(dir + "/link/../c/");
+    (void)cas->put("beside the target");
+    cas->sync();
+  }
+  assert(access((dir + "/sub/c/lock").c_str(), F_OK) == 0);
+  assert(access((dir + "/c").c_str(), F_OK) != 0);
+  printf("dotdot through symlink ok\n");
+}
+
+// a cache opened through a symlink to its directory: a reset replaces
+// the directory the symlink names, so the symlink and the key survive it
+void symlinked_dir_reset(const std::string &dir) {
+  namespace fs = std::filesystem;
+  fs::create_directories(dir + "/real");
+  const std::string alias = dir + "/alias";
+  fs::create_directory_symlink(dir + "/real", alias);
+  {
+    auto cas = PackCas::open(alias);
+    (void)cas->put("x");
+    cas->sync();
+    cas->poison("probe");
+  }
+  const std::string key = PackCas::cache_key(alias);
+  auto cas = PackCas::open(alias); // resets the poisoned cache
+  assert(!cas->has(blake3_hash("x")));
+  assert(fs::is_symlink(alias));
+  assert(!fs::exists(dir + "/real/poison"));
+  assert(PackCas::cache_key(alias) == key);
+  printf("symlinked dir reset ok\n");
+}
+
+// every spelling and symlinked alias of a cache's directory is one key
+void cache_keys(const std::string &dir) {
+  namespace fs = std::filesystem;
+  const std::string key = PackCas::cache_key(dir);
+  fs::create_directory_symlink(dir, dir + "-alias");
+  for (const std::string &spelling :
+       {dir + "/", dir + "/.", dir + "//", dir + "-alias", dir + "-alias/"}) {
+    assert(PackCas::cache_key(spelling) == key);
+  }
+  assert(PackCas::cache_key(dir + "-other") != key);
+  // a reset replaces the directory, not the cache's name
+  {
+    auto cas = PackCas::open(dir);
+    (void)cas->put("x");
+    cas->sync();
+  }
+  std::ofstream(dir + "/unsynced") << "another boot\n";
+  (void)PackCas::open(dir);
+  assert(PackCas::cache_key(dir) == key);
+  printf("cache keys ok\n");
+}
 #endif
 
 #ifdef __linux__
@@ -1048,6 +1108,9 @@ int main(int argc, char **argv) {
   moved_aside_swept(dir + "/sweep-test");
   sweep_spares_others(dir + "/spare-test");
   trailing_slash_reset(dir + "/slash-test");
+  dotdot_through_symlink(dir + "/dotdot-test");
+  cache_keys(dir + "/key-test");
+  symlinked_dir_reset(dir + "/symlink-test");
   open_errors_keep_cache(dir + "/open-errors-test");
   lmdb_codes(dir + "/lmdb-codes-test");
 #endif
