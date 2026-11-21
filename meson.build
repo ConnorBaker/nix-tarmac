@@ -41,11 +41,35 @@ core_dep = declare_dependency(link_with: core, include_directories: 'src',
 executable('bench', 'bench/bench.cpp', dependencies: core_dep)
 executable('gc_bench', 'bench/gc_bench.cpp', dependencies: core_dep)
 
-foreach t : ['model_test', 'corrupt_test', 'nar_test', 'crash_test', 'gc_test',
-             'tar_semantics_test']
-  test(t, executable(t, 'tests' / t + '.cpp', dependencies: core_dep),
-    timeout: 300)
+# Every test runs under tests/watchdog.cpp, which fails it once it has had
+# its budget of running time; meson's own timeout is off (0), since nixpkgs
+# turns it off anyway and it would count time the build spends frozen.
+# A budget is three times the slowest pass on record (all build logs to
+# 2026-11-21), rounded up to 100 s, and never under 300 s: model_test and
+# crash_test wait on the filesystem journal for each sync, and passed
+# after up to 1113 s and 323 s on a busy aarch64 builder; the rest, 8 s.
+watchdog = executable('watchdog', 'tests/watchdog.cpp')
+test_budgets = {
+  'model_test': 3400,
+  'corrupt_test': 300,
+  'nar_test': 300,
+  'crash_test': 1000,
+  'gc_test': 300,
+  'tar_semantics_test': 300,
+  # must fail: killed by its watchdog, see the file
+  'hang_probe': 1,
+}
+foreach t, budget : test_budgets
+  test(t, watchdog,
+    args: [budget.to_string(),
+           executable(t, 'tests' / t + '.cpp', dependencies: core_dep)],
+    should_fail: t == 'hang_probe',
+    timeout: 0)
 endforeach
+test('watchdog_test', watchdog,
+  args: ['300', executable('watchdog_test', 'tests/watchdog_test.cpp'),
+         watchdog],
+  timeout: 0)
 
 if fuzzing
   executable('fuzz_ingest', 'fuzz/fuzz_ingest.cc',
