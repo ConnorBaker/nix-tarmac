@@ -195,5 +195,6 @@ for v in $versions; do
     echo "FAIL evalstore $v: collected: $invalid" >&2
     exit 1
   }
+  "$repo/tests/store_add.sh" "$nixbin" "$plugin" "$work/storeadd-$v"
   echo "OK evalstore $v: eval + build via $evalstore"
 done
