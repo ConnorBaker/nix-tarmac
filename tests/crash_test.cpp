@@ -4,6 +4,7 @@
 
 #include "tree.hpp"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <lmdb.h>
 #include <signal.h>
@@ -23,9 +24,11 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <vector>
 
 #ifdef __linux__
@@ -98,6 +101,40 @@ static bool watched_exists() {
 static std::map<std::pair<dev_t, ino_t>, off_t> synced_size;
 static const char *durable_dir = nullptr;
 static std::string undurable;
+// fsync(2): a file's fsync does not make its directory entry durable; a
+// fsync of the directory does, for the entries it holds then. Each such
+// fsync records them as (device, directory, file, name), so a name since
+// unlinked, or given to another file, is not taken for durable. The same
+// points require every nonempty pack's name among them; the first that is
+// not is described in `unnamed`
+using DurableName = std::tuple<dev_t, ino_t, ino_t, std::string>;
+static std::set<DurableName> durable_names;
+static std::string unnamed;
+// before the directory's fsync: a name listed here is there when it runs
+static auto names_in(int dir_fd) -> std::vector<DurableName> {
+  std::vector<DurableName> names;
+  struct stat dir_st {};
+  const int list_fd = dup(dir_fd);
+  DIR *listing = list_fd < 0 ? nullptr : fdopendir(list_fd);
+  if (fstat(dir_fd, &dir_st) != 0 || listing == nullptr) {
+    if (listing != nullptr) {
+      closedir(listing);
+    } else if (list_fd >= 0) {
+      close(list_fd);
+    }
+    return names;
+  }
+  rewinddir(listing);
+  while (const dirent *entry = readdir(listing)) {
+    struct stat st {};
+    if (fstatat(dir_fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISREG(st.st_mode)) {
+      names.emplace_back(st.st_dev, dir_st.st_ino, st.st_ino, entry->d_name);
+    }
+  }
+  closedir(listing);
+  return names;
+}
 static unsigned unmarked_index_points = 0;
 static unsigned marker_removals = 0;
 static void note_synced(int fd) {
@@ -107,6 +144,10 @@ static void note_synced(int fd) {
   }
 }
 static void require_packs_on_disk(const char *event) {
+  struct stat dir_st {};
+  if (stat(durable_dir, &dir_st) != 0) {
+    throw std::runtime_error(std::string("stat ") + durable_dir);
+  }
   for (const auto &entry : std::filesystem::directory_iterator(durable_dir)) {
     const std::string name = entry.path().filename();
     struct stat st {};
@@ -119,6 +160,13 @@ static void require_packs_on_disk(const char *event) {
       undurable = std::string(event) + ": " + name + " is " +
                   std::to_string(st.st_size) + " bytes, " +
                   std::to_string(synced) + " of them synced";
+    }
+    if (st.st_size > 0 && unnamed.empty() &&
+        !durable_names.contains(
+            {st.st_dev, dir_st.st_ino, st.st_ino, name})) {
+      unnamed = std::string(event) + ": " + name + " (" +
+                std::to_string(st.st_size) +
+                " bytes) was created after the directory's last fsync";
     }
   }
 }
@@ -145,6 +193,12 @@ static void note_unlink(int dir_fd, const char *path) {
   if (fstatat(dir_fd, path, &st, AT_SYMLINK_NOFOLLOW) == 0) {
     synced_size.erase({st.st_dev, st.st_ino});
   }
+  if (struct stat dir_st {}; fstat(dir_fd, &dir_st) == 0) {
+    std::erase_if(durable_names, [&](const DurableName &known) {
+      return std::get<0>(known) == dir_st.st_dev &&
+             std::get<1>(known) == dir_st.st_ino && std::get<3>(known) == path;
+    });
+  }
   if (durable_dir != nullptr && strcmp(path, "unsynced") == 0) {
     marker_removals++;
     require_packs_on_disk("marker removal");
@@ -168,9 +222,11 @@ msync(void *addr, size_t len, int flags) {
 }
 extern "C" __attribute__((visibility("default"))) int fsync(int fd) {
   struct stat st {};
+  std::vector<DurableName> names;
   if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
     dir_fsyncs++;
     watched_at_dir_fsync = watched_exists();
+    names = names_in(fd);
   } else {
     fsyncs++;
     if (auto *hook = before_file_fsync) {
@@ -181,6 +237,7 @@ extern "C" __attribute__((visibility("default"))) int fsync(int fd) {
   const int res = static_cast<int>(syscall(SYS_fsync, fd));
   if (res == 0) {
     note_synced(fd);
+    durable_names.insert(names.begin(), names.end());
   }
   return res;
 }
@@ -1195,10 +1252,17 @@ void lmdb_codes(const std::string &dir) {
 // under the marker, which makes open() reset the cache after a crash.
 // So: a commit or flush of the index without the marker, and the
 // marker's removal, come after the pack's fdatasync. sync() removes the
-// marker; compact() commits the new pack's index without one.
+// marker; compact() commits the new pack's index without one. Nor does a
+// crash keep a new file's name unless its directory was fsynced after the
+// file was created (fsync(2)), so those points also come after the
+// directory's fsync that holds each nonempty pack's name: compact()'s
+// new pack would otherwise be named by an index that a crash keeps while
+// the pack itself is gone.
 void pack_durable_before_index(const std::string &dir) {
   synced_size.clear();
   undurable.clear();
+  durable_names.clear();
+  unnamed.clear();
   unmarked_index_points = marker_removals = 0;
   auto blob = [](unsigned i) {
     std::string b = "durable-" + std::to_string(i) + "-";
@@ -1227,6 +1291,11 @@ void pack_durable_before_index(const std::string &dir) {
     fflush(stdout);
   }
   assert(undurable.empty());
+  if (!unnamed.empty()) {
+    printf("pack name durable before index: %s\n", unnamed.c_str());
+    fflush(stdout);
+  }
+  assert(unnamed.empty());
   // the checks ran: three syncs removed the marker, one of them
   // compact()'s own, and the compaction committed and flushed the index
   // without it
@@ -1241,10 +1310,13 @@ void pack_durable_before_index(const std::string &dir) {
 
 // Without a boot id (macOS has no /proc) there is no marker, so every
 // commit is synced (MDB_NOMETASYNC) and commit_batch() fdatasyncs the
-// pack before it
+// pack before it, and fsyncs the directory that names it: open() created
+// the pack, and no marker's write fsynced the directory since
 void boot_id_less_commit(const std::string &dir) {
   synced_size.clear();
   undurable.clear();
+  durable_names.clear();
+  unnamed.clear();
   unmarked_index_points = marker_removals = 0;
   auto blob = [](unsigned i) {
     std::string b = "bootless-" + std::to_string(i) + "-";
@@ -1269,6 +1341,11 @@ void boot_id_less_commit(const std::string &dir) {
     fflush(stdout);
   }
   assert(undurable.empty());
+  if (!unnamed.empty()) {
+    printf("boot-id-less commit name: %s\n", unnamed.c_str());
+    fflush(stdout);
+  }
+  assert(unnamed.empty());
   assert(unmarked_index_points >= 1);
   auto cas = PackCas::open(dir);
   for (unsigned i = 0; i < 20; i++) {
