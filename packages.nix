@@ -84,5 +84,11 @@ lib.makeScope newScope (
       nix = nixVersions.latest;
       plugin = self.default;
     };
+
+    # an evaluation spanning a reset of its eval store fails
+    after-reset = self.callPackage ./tests/after-reset.nix {
+      nix = nixVersions.latest;
+      plugin = self.default;
+    };
   }
 )

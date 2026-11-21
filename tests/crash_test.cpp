@@ -42,8 +42,6 @@ static bool watched_at_msync = false;
 static bool watched_at_dir_fsync = false;
 static bool watched_at_commit = false;
 static bool fail_next_commit = false;
-// runs once, before the next fsync of a regular file
-static void (*before_file_fsync)() = nullptr;
 // gets a byte when a non-blocking flock first finds the lock taken
 static int notify_lock_wait = -1;
 // runs once, before the next non-blocking flock
@@ -77,10 +75,6 @@ extern "C" __attribute__((visibility("default"))) int fsync(int fd) {
     watched_at_dir_fsync = watched_exists();
   } else {
     fsyncs++;
-    if (auto *hook = before_file_fsync) {
-      before_file_fsync = nullptr;
-      hook();
-    }
   }
   return static_cast<int>(syscall(SYS_fsync, fd));
 }
@@ -530,7 +524,6 @@ template <typename Body> void in_child(Body body) {
   const pid_t pid = fork();
   assert(pid >= 0);
   if (pid == 0) {
-    before_file_fsync = nullptr;
     body();
     _exit(0);
   }
@@ -546,6 +539,16 @@ bool reads_back(PackCas &cas, const std::string &data) {
   } catch (const CorruptError &) {
     return false;
   }
+}
+
+// whether f fails because the cache it used was replaced
+template <typename F> auto throws_replaced(F f) -> bool {
+  try {
+    f();
+  } catch (const ReplacedError &) {
+    return true;
+  }
+  return false;
 }
 
 // an open that another process's reset lands in opens the new cache
@@ -601,24 +604,15 @@ void replaced_cache(const std::string &dir) {
   in_child([&] { (void)PackCas::open(dir); });
   assert(access(marker.c_str(), F_OK) != 0);
 
-  // the new cache's writer commits between the stale writer's marker
-  // write and its rename
-  before_file_fsync = commit_fresh;
-  (void)stale->put("stale, after the reset");
-  try {
-    stale->commit();
-  } catch (const std::exception &err) {
-    printf("replaced cache: stale commit failed: %s\n", err.what());
-    fflush(stdout);
-    assert(!"a stale writer's commit failed");
-  }
-  if (before_file_fsync != nullptr) {
-    before_file_fsync = nullptr;
-    commit_fresh();
-  }
+  // a write of the stale writer's would land in the replaced cache, where
+  // no later process finds it: it fails instead
+  assert(throws_replaced([&] { (void)stale->put("stale, after the reset"); }));
+  assert(access(marker.c_str(), F_OK) != 0);
+  commit_fresh();
   assert(first_line(marker) == boot);
-  // the stale writer's sync does not unmark the new cache's commit
-  stale->sync();
+  // the stale writer's sync does not unmark the new cache's commit, nor
+  // take it for its own
+  assert(!throws_replaced([&] { stale->sync(); }));
   assert(first_line(marker) == boot);
   // nor does its compaction retire the new cache's pack, nor fail
   try {
@@ -767,14 +761,12 @@ void stale_writer_new_pack(const std::string &dir) {
     }
   } catch (const std::runtime_error &) {
   }
-  // its pack is gone with its directory: a write fails
+  // its directory is gone: a write fails
   const auto stale_put = [&](const char *data) {
-    try {
+    assert(throws_replaced([&] {
       (void)stale->put(data);
       stale->commit();
-    } catch (const std::system_error &err) {
-      assert(err.code().value() == ENOENT);
-    }
+    }));
   };
   stale_put("stale-one");
   in_child([] {
@@ -862,19 +854,36 @@ void partial_reset(const std::string &dir) {
   printf("partial reset: directory %s after the reset\n",
          stat(dir.c_str(), &after) == 0 ? "survived" : "is gone");
   fflush(stdout);
-  // a writer of the cache now at dir commits between the stale writer's
-  // marker write and its rename, as in replaced_cache
-  before_file_fsync = commit_fresh;
-  (void)stale->put("stale, after the reset");
-  try {
-    stale->commit();
-  } catch (const std::exception &err) {
-    printf("partial reset: stale commit failed: %s\n", err.what());
-    fflush(stdout);
-    assert(!"a stale writer's commit failed after a partial reset");
-  }
-  before_file_fsync = nullptr;
+  // the stale writer's write fails, as in replaced_cache
+  assert(throws_replaced([&] { (void)stale->put("stale, after the reset"); }));
   printf("partial reset ok\n");
+}
+
+// a process that opened the cache before another process reset it: what
+// it writes would land in the replaced cache, which no later process
+// opens. It fails instead, and the new cache stays as the reset left it.
+// Content reads still work: what the replaced cache holds under a hash
+// is that hash's content.
+void writes_after_reset(const std::string &dir) {
+  replaced = dir;
+  auto stale = PackCas::open(dir);
+  const std::string before = stale->put("before the reset");
+  stale->meta_put("record", "before the reset");
+  stale->sync();
+  std::ofstream(dir + "/unsynced") << "another boot\n";
+  in_child([] { (void)PackCas::open(replaced); });
+  assert(throws_replaced([&] { (void)stale->put("after the reset"); }));
+  assert(throws_replaced([&] { stale->meta_put("record", "after"); }));
+  assert(throws_replaced([&] { stale->meta_del("record"); }));
+  assert(stale->has(before));
+  assert(throws_replaced([&] { stale->check_live(); }));
+  stale.reset();
+  auto fresh = PackCas::open(dir);
+  std::string out;
+  assert(!fresh->has(blake3_hash("after the reset")));
+  assert(!fresh->has(before));
+  assert(!fresh->meta_get("record", out));
+  printf("writes after a reset ok\n");
 }
 
 // a cache a reset moved aside and never finished removing, as after a
@@ -1096,6 +1105,7 @@ int main(int argc, char **argv) {
   reset_of_replaced_cache(dir + "/replaced-reset-test");
   stale_writer_new_pack(dir + "/stale-pack-test");
   partial_reset(dir + "/partial-reset-test");
+  writes_after_reset(dir + "/writes-after-reset-test");
   moved_aside_swept(dir + "/sweep-test");
   sweep_spares_others(dir + "/spare-test");
   trailing_slash_reset(dir + "/slash-test");
