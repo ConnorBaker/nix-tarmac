@@ -1242,10 +1242,19 @@ void PackCas::compact(const std::function<bool(std::string_view)> &live) {
     }
     impl.write_gen(txn.get(), gen + 1);
     txn.commit();
-    mdb_check(mdb_env_sync(impl.env, 1), "env_sync");
-
+    // the index names the new pack: a failure from here on keeps it, as
+    // removing it lets the next batch recreate it empty under that index
     close(new_fd);
     new_fd = -1;
+    // Linux reports a failed writeback once and may drop the unwritten
+    // pages, so a later sync can succeed and remove the marker over index
+    // pages that never reached the disk: the next open resets instead
+    if (const int res = mdb_env_sync(impl.env, 1); res != MDB_SUCCESS) {
+      poison(std::string("the compacted index's flush failed: ") +
+             mdb_strerror(res));
+      mdb_check(res, "env_sync compaction");
+    }
+
     unlinkat(impl.dir_fd, Impl::pack_name(gen).c_str(), 0);
     impl.mapping_for(gen + 1, true);
     impl.committed_end = impl.end = new_off;
