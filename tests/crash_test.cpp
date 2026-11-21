@@ -563,7 +563,11 @@ void crash_recovery(const std::string &dir) {
   std::string out;
   while (fgets(line, sizeof(line), f)) {
     assert(strlen(line) == 65);
-    assert(cas->get(from_hex({line, 64}), out));
+    const std::string hash = from_hex({line, 64});
+    assert(cas->get(hash, out));
+    // put() keys a blob by blake3_hash: get() finding the entry, and LZ4
+    // decoding it, does not make what it returned that hash's blob
+    assert(blake3_hash(out) == hash);
     n++;
   }
   fclose(f);
@@ -670,7 +674,7 @@ void unsynced_marker(const std::string &dir) {
   std::ofstream(marker).close();
   {
     auto cas = PackCas::open(dir);
-    assert(cas->get(hash, out));
+    assert(cas->get(hash, out) && out == "unsynced");
     (void) cas->put("over an empty marker");
     cas->commit();
     assert(first_line(marker) == first_line("/proc/sys/kernel/random/boot_id"));
