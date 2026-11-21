@@ -190,7 +190,8 @@ public:
   auto operator=(const WriteTxn &) -> WriteTxn & = delete;
   auto operator=(WriteTxn &&) -> WriteTxn & = delete;
   [[nodiscard]] auto get() const -> MDB_txn * { return txn_; }
-  void commit() {
+  // LMDB's result: a caller checks it with Impl::check_commit
+  [[nodiscard]] auto commit() -> int {
     if (owned_) {
       MDB_txn *txn = txn_;
       txn_ = nullptr;
@@ -204,8 +205,9 @@ public:
       const int res = mdb_txn_commit(txn);
       mdb_env_set_flags(env_, MDB_NOMETASYNC, flags & MDB_NOMETASYNC);
       mdb_env_set_flags(env_, MDB_NOSYNC, flags & MDB_NOSYNC);
-      mdb_check(res, "txn_commit");
+      return res;
     }
+    return MDB_SUCCESS;
   }
 
 private:
@@ -674,7 +676,7 @@ struct PackCas::Impl {
     wtxn = nullptr; // freed by LMDB, committed or not
     if (res != MDB_SUCCESS) {
       abort_batch();
-      mdb_check(res, "txn_commit");
+      check_commit(res);
     }
     committed_end = end;
     mapping->size = end;
@@ -690,15 +692,111 @@ struct PackCas::Impl {
   }
 
   // under the writer mutex: no commit lands between the syncs and the
-  // marker's removal
+  // marker's removal. Linux reports a failed writeback once and may drop
+  // the unwritten pages, so after a failed flush a later sync can succeed
+  // and remove the marker over pack or index pages that never reached the
+  // disk: the next open resets the cache instead
   void sync_all() {
     const WriteTxn txn(env, nullptr);
-    if (data_sync(current()->pack_fd) < 0) {
-      sys_err("fdatasync pack");
+    try {
+      if (data_sync(current()->pack_fd) < 0) {
+        sys_err("fdatasync pack");
+      }
+      mdb_check(mdb_env_sync(env, 1), "env_sync");
+    } catch (const std::exception &err) {
+      poison(std::string("a sync's flush failed: ") + err.what());
+      throw;
     }
-    mdb_check(mdb_env_sync(env, 1), "env_sync");
     if (unlinkat(dir_fd, "unsynced", 0) == 0) {
       sync_dir();
+    }
+  }
+
+  // A commit flushes the index map when it runs under MDB_NOMETASYNC:
+  // every WriteTxn's, and every one without a boot id. Like sync_all()'s
+  // flush, that one can be the flush that is told of a failed writeback
+  // and then succeeds no more, over earlier unsynced commits' pages, so a
+  // commit whose flush failed poisons the cache too. Under MDB_WRITEMAP
+  // the flush is mdb_txn_commit's only I/O (mdb.c: mdb_page_flush only
+  // clears the dirty pages' flags, mdb_env_write_meta writes the meta
+  // page in the map, and mdb_env_sync returns msync's errno). LMDB's own
+  // codes are negative (lmdb.h: "BerkeleyDB uses -30800 to -30999, we'll
+  // go under them"): MDB_MAP_FULL and its kind commit nothing and corrupt
+  // nothing, and reset nothing. A positive one is an errno: the flush's,
+  // or another a commit can return (ENOMEM, EINVAL), whose reset is a cost
+  // accepted, as sync_all()'s.
+  void check_commit(int res) const {
+    if (res > 0) {
+      poison(std::string("an index commit failed: ") + strerror(res));
+    }
+    mdb_check(res, "txn_commit");
+  }
+
+  // The next open() resets a cache whose directory holds a poison, and
+  // reports the reason the poison holds. Its existence is what resets,
+  // always. Its reason is whole when it was written and renamed into place;
+  // after a failed step it may be empty or partial: a failed write leaves
+  // it so, and one created in place is neither truncated nor placed at
+  // once, and is written by a single write(2), which may be short, so a
+  // concurrent open may read part of it. A poison records a corruption,
+  // which a system crash keeps and later writes can hide (a batch
+  // appending at a truncated pack's end writes over offsets the index
+  // names), so its bytes and name are synced.
+  //
+  // A failed step is reported, never thrown: the callers are handling the
+  // corruption, and the next open() must still reset. The poison's
+  // existence is what resets, so after a failed write or sync it is placed
+  // still, and when it cannot be created or renamed it is created in place.
+  // ENOENT means a replaced cache, whose directory is gone and the poison
+  // with it: nothing is left to reset.
+  void poison(std::string_view why) const {
+    const std::string line = std::string(why) + "\n";
+    const std::string tmp = "poison." + std::to_string(getpid()) + ".tmp";
+    const auto failed = [&](const char *step, int err) {
+      report_poison_failure(dir, step, err);
+    };
+    bool placed = false;
+    if (const int fd =
+            open_in_dir(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
+        fd < 0) {
+      if (errno == ENOENT) {
+        return;
+      }
+      failed("create the poison", errno);
+    } else {
+      try {
+        write_all(fd, line);
+      } catch (const std::system_error &err) {
+        failed("write the poison", err.code().value());
+      }
+      if (fsync(fd) < 0) {
+        failed("sync the poison", errno);
+      }
+      close(fd);
+      if (renameat(dir_fd, tmp.c_str(), dir_fd, "poison") == 0) {
+        placed = true;
+      } else {
+        const int err = errno;
+        unlinkat(dir_fd, tmp.c_str(), 0);
+        if (err == ENOENT) {
+          return;
+        }
+        failed("rename the poison into place", err);
+      }
+    }
+    if (!placed) {
+      const int fd = open_in_dir("poison", O_WRONLY | O_CREAT | O_CLOEXEC);
+      if (fd < 0) {
+        failed("create the poison in place", errno);
+        return;
+      }
+      if (write(fd, line.data(), line.size()) < 0 || fsync(fd) < 0) {
+        failed("write the poison in place", errno);
+      }
+      close(fd);
+    }
+    if (fsync(dir_fd) < 0) {
+      failed("sync the cache directory", errno);
     }
   }
 
@@ -863,74 +961,7 @@ auto PackCas::open(const std::string &spelled) -> std::unique_ptr<PackCas> {
   throw std::runtime_error("cache replaced during every open");
 }
 
-// The next open() resets a cache whose directory holds a poison, and
-// reports the reason the poison holds. Its existence is what resets,
-// always. Its reason is whole when it was written and renamed into place;
-// after a failed step it may be empty or partial: a failed write leaves
-// it so, and one created in place is neither truncated nor placed at
-// once, and is written by a single write(2), which may be short, so a
-// concurrent open may read part of it. A poison records a corruption,
-// which a system crash keeps and later writes can hide (a batch
-// appending at a truncated pack's end writes over offsets the index
-// names), so its bytes and name are synced.
-//
-// A failed step is reported, never thrown: the callers are handling the
-// corruption, and the next open() must still reset. The poison's
-// existence is what resets, so after a failed write or sync it is placed
-// still, and when it cannot be created or renamed it is created in place.
-// ENOENT means a replaced cache, whose directory is gone and the poison
-// with it: nothing is left to reset.
-void PackCas::poison(std::string_view why) {
-  auto &impl = *impl_;
-  const std::string line = std::string(why) + "\n";
-  const std::string tmp = "poison." + std::to_string(getpid()) + ".tmp";
-  const auto failed = [&](const char *step, int err) {
-    report_poison_failure(impl.dir, step, err);
-  };
-  bool placed = false;
-  if (const int fd =
-          impl.open_in_dir(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
-      fd < 0) {
-    if (errno == ENOENT) {
-      return;
-    }
-    failed("create the poison", errno);
-  } else {
-    try {
-      write_all(fd, line);
-    } catch (const std::system_error &err) {
-      failed("write the poison", err.code().value());
-    }
-    if (fsync(fd) < 0) {
-      failed("sync the poison", errno);
-    }
-    close(fd);
-    if (renameat(impl.dir_fd, tmp.c_str(), impl.dir_fd, "poison") == 0) {
-      placed = true;
-    } else {
-      const int err = errno;
-      unlinkat(impl.dir_fd, tmp.c_str(), 0);
-      if (err == ENOENT) {
-        return;
-      }
-      failed("rename the poison into place", err);
-    }
-  }
-  if (!placed) {
-    const int fd = impl.open_in_dir("poison", O_WRONLY | O_CREAT | O_CLOEXEC);
-    if (fd < 0) {
-      failed("create the poison in place", errno);
-      return;
-    }
-    if (write(fd, line.data(), line.size()) < 0 || fsync(fd) < 0) {
-      failed("write the poison in place", errno);
-    }
-    close(fd);
-  }
-  if (fsync(impl.dir_fd) < 0) {
-    failed("sync the cache directory", errno);
-  }
-}
+void PackCas::poison(std::string_view why) { impl_->poison(why); }
 
 auto PackCas::cache_key(const std::string &dir) -> std::string {
   std::filesystem::create_directories(dir);
@@ -1047,7 +1078,7 @@ auto PackCas::open_files(std::unique_ptr<Impl> impl, const std::string &dir)
     mdb_txn_abort(txn);
     throw;
   }
-  mdb_check(mdb_txn_commit(txn), "txn_commit");
+  impl->check_commit(mdb_txn_commit(txn));
 
   if (flock(impl->lock_fd, LOCK_EX | LOCK_NB) == 0) {
     // a compaction may have retired `gen` before we took the flock
@@ -1241,7 +1272,7 @@ void PackCas::compact(const std::function<bool(std::string_view)> &live) {
                 "mdb_put");
     }
     impl.write_gen(txn.get(), gen + 1);
-    txn.commit();
+    impl.check_commit(txn.commit());
     // the index names the new pack: a failure from here on keeps it, as
     // removing it lets the next batch recreate it empty under that index
     close(new_fd);
@@ -1282,7 +1313,7 @@ void PackCas::meta_put(
     MDB_val mval = to_val(val);
     mdb_check(mdb_put(txn.get(), impl.meta, &mkey, &mval, 0), "mdb_put meta");
   }
-  txn.commit();
+  impl.check_commit(txn.commit());
 }
 
 auto PackCas::meta_get(std::string_view key, std::string &out) -> bool {
@@ -1313,7 +1344,7 @@ void PackCas::meta_del(const std::vector<std::string> &keys) {
       mdb_check(res, "mdb_del meta");
     }
   }
-  txn.commit();
+  impl.check_commit(txn.commit());
 }
 
 void PackCas::meta_scan(
