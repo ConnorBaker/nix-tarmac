@@ -177,4 +177,20 @@ for v in $versions; do
     exit 1
   }
   echo "OK evalstore $v: eval + build via $evalstore"
+
+  # one cache in one process opens one LMDB environment: the eval store
+  # named with a trailing slash and the fetcher's default directory are
+  # that one cache
+  strace=$(nix build --no-link --print-out-paths nixpkgs#strace.out)/bin/strace
+  aliased="$work/cache-alias-$v"
+  XDG_CACHE_HOME="$aliased" "$strace" -f -e trace=openat -o "$work/alias-$v.trace" \
+    "$nixbin" eval --extra-experimental-features 'nix-command flakes' --impure \
+    --raw --plugin-files "$plugin" --eval-store "tarmac://$aliased/nix/tarmac/" \
+    --expr "$expr" >/dev/null
+  opens=$(grep -c 'index/data\.mdb", O_RDWR' "$work/alias-$v.trace" || true)
+  [[ $opens == 1 ]] || {
+    echo "FAIL evalstore $v: one cache opened $opens times in one process" >&2
+    exit 1
+  }
+  echo "OK evalstore $v: tarmac://<dir>/ and <dir> share one store"
 done

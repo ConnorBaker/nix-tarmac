@@ -24,6 +24,12 @@ struct CorruptError : std::runtime_error {
 class PackCas {
 public:
   static auto open(const std::string &dir) -> std::unique_ptr<PackCas>;
+  // the cache at dir, which it creates if absent, as one name: the
+  // resolved directory, which open() uses. Equal for every spelling and
+  // symlinked alias of the directory, and the same across resets; not
+  // for a bind mount of it at another path. LMDB forbids opening one
+  // environment twice in a process, so a process keeps one PackCas per key.
+  static auto cache_key(const std::string &dir) -> std::string;
   ~PackCas();
 
   PackCas(const PackCas &) = delete;
