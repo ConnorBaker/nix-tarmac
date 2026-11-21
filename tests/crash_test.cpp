@@ -14,6 +14,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
@@ -48,6 +49,12 @@ static bool watched_at_msync = false;
 static bool watched_at_dir_fsync = false;
 static bool watched_at_commit = false;
 static bool fail_next_commit = false;
+// the next fsync of a regular file, of a directory, the next write(2)
+// and the next renameat(2) fail with these errnos instead, if nonzero
+static int fail_file_fsync_with = 0;
+static int fail_dir_fsync_with = 0;
+static int fail_write_with = 0;
+static int fail_rename_with = 0;
 // runs once, before the next fsync of a regular file
 static void (*before_file_fsync)() = nullptr;
 // gets a byte when a non-blocking flock first finds the lock taken
@@ -225,10 +232,20 @@ extern "C" __attribute__((visibility("default"))) int fsync(int fd) {
   struct stat st {};
   std::vector<DurableName> names;
   if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+    if (const int err = fail_dir_fsync_with; err != 0) {
+      fail_dir_fsync_with = 0;
+      errno = err;
+      return -1;
+    }
     dir_fsyncs++;
     watched_at_dir_fsync = watched_exists();
     names = names_in(fd);
   } else {
+    if (const int err = fail_file_fsync_with; err != 0) {
+      fail_file_fsync_with = 0;
+      errno = err;
+      return -1;
+    }
     fsyncs++;
     if (auto *hook = before_file_fsync) {
       before_file_fsync = nullptr;
@@ -342,6 +359,26 @@ mdb_txn_commit(MDB_txn *txn) {
   return real(txn);
 }
 
+extern "C" __attribute__((visibility("default"))) ssize_t
+write(int fd, const void *buf, size_t len) {
+  if (const int err = fail_write_with; err != 0) {
+    fail_write_with = 0;
+    errno = err;
+    return -1;
+  }
+  return syscall(SYS_write, fd, buf, len);
+}
+extern "C" __attribute__((visibility("default"))) int
+renameat(int old_dir, const char *old_path, int new_dir,
+         const char *new_path) noexcept {
+  if (const int err = fail_rename_with; err != 0) {
+    fail_rename_with = 0;
+    errno = err;
+    return -1;
+  }
+  return static_cast<int>(
+      syscall(SYS_renameat2, old_dir, old_path, new_dir, new_path, 0));
+}
 // the next non-blocking flock first compacts `compact_first` in a child:
 // it lands between open()'s index read and its writer flock
 static const char *compact_first = nullptr;
@@ -802,8 +839,11 @@ void replaced_cache(const std::string &dir) {
     fflush(stdout);
     assert(!"a stale writer's compaction failed");
   }
-  // nor does its poison reset the new cache
+  // nor does its poison reset the new cache, nor report a failure: the
+  // stale cache's directory is gone
+  logged.clear();
   stale->poison("stale");
+  assert(logged.empty());
   {
     auto fresh = PackCas::open(dir);
     assert(reads_back(*fresh, "fresh"));
@@ -1369,6 +1409,121 @@ void boot_id_less_commit(const std::string &dir) {
   }
   printf("boot-id-less commit ok\n");
 }
+
+// A poison records a corruption found in the cache, which a system crash
+// does not undo and later writes can hide: a batch appends at a
+// truncated pack's end, over offsets the index names. The next open()
+// resets the cache and reports why (pack_cas.hpp), after a system crash
+// too, so the poison's bytes and its name are on disk once poison()
+// returns
+void poison_durable(const std::string &dir) {
+  auto cas = PackCas::open(dir);
+  (void)cas->put("poisoned");
+  cas->sync();
+  synced_size.clear();
+  durable_names.clear();
+  cas->poison("found corrupt");
+  struct stat dir_st {};
+  struct stat st {};
+  assert(stat(dir.c_str(), &dir_st) == 0 &&
+         stat((dir + "/poison").c_str(), &st) == 0);
+  const auto synced = synced_size.find({st.st_dev, st.st_ino});
+  if (synced == synced_size.end() || synced->second != st.st_size) {
+    printf("poison durable: its %lld bytes are not synced\n",
+           static_cast<long long>(st.st_size));
+    fflush(stdout);
+    assert(!"the poison's bytes are not synced");
+  }
+  if (!durable_names.contains({st.st_dev, dir_st.st_ino, st.st_ino, "poison"})) {
+    printf("poison durable: its name is not synced\n");
+    fflush(stdout);
+    assert(!"the poison's name is not synced");
+  }
+  cas.reset();
+  logged.clear();
+  (void)PackCas::open(dir);
+  assert(logged.find("poisoned: found corrupt") != std::string::npos);
+  printf("poison durable ok\n");
+}
+
+// poison() reports a step that fails and does not throw: its callers are
+// handling the corruption. The poison is still placed, so the next open
+// resets the cache, and says why unless the failed step wrote the reason.
+// Placed in place, after a failed create or rename, its bytes are synced.
+void poison_failures(const std::string &dir) {
+  auto check = [](bool held, const std::string &step, const char *what) {
+    if (!held) {
+      printf("poison failures: %s: %s\n", step.c_str(), what);
+      fflush(stdout);
+      assert(!"a poison step's failure was mishandled");
+    }
+  };
+  auto run = [&](const std::string &step, const char *report,
+                 const char *reason, bool in_place, auto inject,
+                 auto injected) {
+    std::string sub = dir + "/" + step;
+    std::ranges::replace(sub, ' ', '-');
+    {
+      auto cas = PackCas::open(sub);
+      (void)cas->put("poisoned");
+      cas->sync();
+      synced_size.clear();
+      logged.clear();
+      inject();
+      bool threw = false;
+      try {
+        cas->poison("found corrupt");
+      } catch (const std::exception &) {
+        threw = true;
+      }
+      check(injected(), step, "the injected failure never ran");
+      struct stat st {};
+      check(stat((sub + "/poison").c_str(), &st) == 0, step,
+            "no poison was placed");
+      check(!threw, step, "poison() threw");
+      check(logged.find(report) != std::string::npos, step,
+            "the failure was not reported");
+      if (in_place) {
+        const auto synced = synced_size.find({st.st_dev, st.st_ino});
+        check(synced != synced_size.end() && synced->second == st.st_size,
+              step, "the poison placed in place is not synced");
+      }
+    }
+    logged.clear();
+    (void)PackCas::open(sub);
+    check(logged.find(reason) != std::string::npos, step,
+          "the next open did not reset with the reason");
+  };
+  run("sync", "could not sync the poison", "poisoned: found corrupt", false,
+      [] { fail_file_fsync_with = EIO; },
+      [] { return fail_file_fsync_with == 0; });
+  run("write", "could not write the poison", "poisoned: ", false,
+      [] { fail_write_with = EIO; }, [] { return fail_write_with == 0; });
+  run("directory sync", "could not sync the cache directory",
+      "poisoned: found corrupt", false, [] { fail_dir_fsync_with = EIO; },
+      [] { return fail_dir_fsync_with == 0; });
+  run("create", "could not create the poison", "poisoned: found corrupt",
+      true,
+      [] {
+        fail_open_suffix = ".tmp";
+        fail_open_errno = EACCES;
+      },
+      [] { return fail_open_suffix == nullptr; });
+  run("rename", "could not rename the poison into place",
+      "poisoned: found corrupt", true, [] { fail_rename_with = EIO; },
+      [] { return fail_rename_with == 0; });
+  // ENOENT says the directory is gone, with the cache it held: nothing
+  // to place, nothing to report
+  {
+    auto cas = PackCas::open(dir + "/gone");
+    logged.clear();
+    fail_rename_with = ENOENT;
+    cas->poison("gone");
+    check(fail_rename_with == 0 && logged.empty(), "rename ENOENT",
+          "a gone directory's failure was reported");
+  }
+  printf("poison failures ok\n");
+}
 #endif
 
 int main(int argc, char **argv) {
@@ -1395,6 +1550,8 @@ int main(int argc, char **argv) {
   lmdb_codes(dir + "/lmdb-codes-test");
   pack_durable_before_index(dir + "/durable-test");
   boot_id_less_commit(dir + "/bootless-test");
+  poison_durable(dir + "/poison-durable-test");
+  poison_failures(dir + "/poison-failures-test");
 #endif
   return 0;
 }
