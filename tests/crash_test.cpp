@@ -49,6 +49,8 @@ static bool watched_at_msync = false;
 static bool watched_at_dir_fsync = false;
 static bool watched_at_commit = false;
 static bool fail_next_commit = false;
+// the next forced mdb_env_sync fails with this errno instead, if nonzero
+static int fail_env_sync_with = 0;
 // the next fsync of a regular file, of a directory, the next write(2)
 // and the next renameat(2) fail with these errnos instead, if nonzero
 static int fail_file_fsync_with = 0;
@@ -379,6 +381,21 @@ renameat(int old_dir, const char *old_path, int new_dir,
   return static_cast<int>(
       syscall(SYS_renameat2, old_dir, old_path, new_dir, new_path, 0));
 }
+// an index flush that fails, as one meeting a disk's EIO does: LMDB's
+// mdb_env_sync returns the errno. Only a forced one, as sync_all's and
+// compact()'s are: mdb_txn_commit calls mdb_env_sync(env, 0) itself
+// (mdb.c), and failing that fails the commit instead
+extern "C" __attribute__((visibility("default"))) int
+mdb_env_sync(MDB_env *env, int force) {
+  static auto *const real = reinterpret_cast<int (*)(MDB_env *, int)>(
+      dlsym(RTLD_NEXT, "mdb_env_sync"));
+  if (const int res = fail_env_sync_with; res != 0 && force != 0) {
+    fail_env_sync_with = 0;
+    return res;
+  }
+  return real(env, force);
+}
+
 // the next non-blocking flock first compacts `compact_first` in a child:
 // it lands between open()'s index read and its writer flock
 static const char *compact_first = nullptr;
@@ -1410,6 +1427,65 @@ void boot_id_less_commit(const std::string &dir) {
   printf("boot-id-less commit ok\n");
 }
 
+// A compaction whose index flush fails after its commit has committed:
+// the index names the new pack, so the pack stays. Removing it lets the
+// next batch recreate it empty under that index, and serve later blobs'
+// bytes for the compacted ones. The blobs are incompressible, so a wrong
+// read returns other bytes rather than failing to decompress. A later
+// sync succeeds, and Linux reports the lost writeback no more, so the
+// compaction poisons the cache: the next open resets it.
+void compaction_flush_failure(const std::string &dir) {
+  auto blob = [](unsigned i) {
+    std::mt19937 gen(i);
+    std::string b(2000, '\0');
+    for (auto &c : b) {
+      c = static_cast<char>(gen());
+    }
+    return b;
+  };
+  {
+    auto cas = PackCas::open(dir);
+    for (unsigned i = 0; i < 20; i++) {
+      (void)cas->put(blob(i));
+    }
+    cas->sync();
+    fail_env_sync_with = EIO;
+    bool threw = false;
+    try {
+      cas->compact([](std::string_view) { return true; });
+    } catch (const std::runtime_error &err) {
+      threw = std::string(err.what()).starts_with("env_sync compaction: ");
+      if (!threw) {
+        printf("compaction flush failure: compact() threw %s\n", err.what());
+        fflush(stdout);
+      }
+    }
+    // compact()'s own flush failed, after its commit
+    assert(threw && fail_env_sync_with == 0);
+    for (unsigned i = 20; i < 40; i++) {
+      (void)cas->put(blob(i));
+    }
+    cas->sync();
+    for (unsigned i = 0; i < 40; i++) {
+      if (!reads_back(*cas, blob(i))) {
+        printf("compaction flush failure: blob %u lost\n", i);
+        fflush(stdout);
+        assert(!"a blob was lost after the compaction's failed flush");
+      }
+    }
+  }
+  logged.clear();
+  auto cas = PackCas::open(dir);
+  if (logged.find("poisoned: the compacted index's flush failed: ") ==
+      std::string::npos) {
+    printf("compaction flush failure: the reopen logged \"%s\"\n",
+           logged.c_str());
+    fflush(stdout);
+    assert(!"the cache did not reset after the compaction's failed flush");
+  }
+  printf("compaction flush failure ok\n");
+}
+
 // A poison records a corruption found in the cache, which a system crash
 // does not undo and later writes can hide: a batch appends at a
 // truncated pack's end, over offsets the index names. The next open()
@@ -1550,6 +1626,7 @@ int main(int argc, char **argv) {
   lmdb_codes(dir + "/lmdb-codes-test");
   pack_durable_before_index(dir + "/durable-test");
   boot_id_less_commit(dir + "/bootless-test");
+  compaction_flush_failure(dir + "/compact-flush-test");
   poison_durable(dir + "/poison-durable-test");
   poison_failures(dir + "/poison-failures-test");
 #endif
