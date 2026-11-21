@@ -223,6 +223,10 @@ struct Mapping {
   int pack_fd = -1;
   uint64_t gen = 0;
   std::atomic<uint64_t> size{0};
+  // set once this process fsyncs the directory after mapping the pack,
+  // which makes its name durable (fsync(2)): whoever created the pack may
+  // have died before doing so
+  std::atomic<bool> name_synced{false};
 
   Mapping() = default;
   Mapping(const Mapping &) = delete;
@@ -642,9 +646,16 @@ struct PackCas::Impl {
     auto mapping = current();
     try {
       mark_unsynced();
-      // without a marker, the pack must be on disk before the index names it
-      if (boot.empty() && data_sync(mapping->pack_fd) < 0) {
-        sys_err("fdatasync pack");
+      // without a marker, the pack must be on disk before the index names
+      // it, and so must its name
+      if (boot.empty()) {
+        if (data_sync(mapping->pack_fd) < 0) {
+          sys_err("fdatasync pack");
+        }
+        if (!mapping->name_synced) {
+          sync_dir();
+          mapping->name_synced = true;
+        }
       }
     } catch (...) {
       abort_batch();
@@ -1164,6 +1175,8 @@ void PackCas::compact(const std::function<bool(std::string_view)> &live) {
     if (data_sync(new_fd) < 0) {
       sys_err("fdatasync new pack");
     }
+    // and its name: the commit below names it without a marker
+    impl.sync_dir();
 
     mdb_check(mdb_drop(txn.get(), impl.blobs, 0), "mdb_drop");
     for (auto &[hash, entry] : keep) {
