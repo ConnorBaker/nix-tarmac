@@ -378,6 +378,15 @@ void report_reset(const std::string &dir, const std::string &why) {
          why.c_str());
 }
 
+// a step of poison() failed: the cache may not reset, or not say why
+void report_poison_failure(const std::string &dir, const char *step, int err) {
+  fprintf(stderr, "nix-tarmac: poisoning the cache %s: could not %s: %s\n",
+          dir.c_str(), step, strerror(err));
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): syslog(3) is variadic
+  syslog(LOG_WARNING, "nix-tarmac: poisoning the cache %s: could not %s: %s",
+         dir.c_str(), step, strerror(err));
+}
+
 // removes a cache a reset moved aside. Only processes of that cache
 // create files in it, and only until its directory is gone; what cannot be
 // removed is left under its own name, never at dir.
@@ -854,26 +863,72 @@ auto PackCas::open(const std::string &spelled) -> std::unique_ptr<PackCas> {
   throw std::runtime_error("cache replaced during every open");
 }
 
-// a rename: an open never sees a partial poison. A replaced cache's
-// directory is gone, so its poison never reaches the new cache.
+// The next open() resets a cache whose directory holds a poison, and
+// reports the reason the poison holds. Its existence is what resets,
+// always. Its reason is whole when it was written and renamed into place;
+// after a failed step it may be empty or partial: a failed write leaves
+// it so, and one created in place is neither truncated nor placed at
+// once, and is written by a single write(2), which may be short, so a
+// concurrent open may read part of it. A poison records a corruption,
+// which a system crash keeps and later writes can hide (a batch
+// appending at a truncated pack's end writes over offsets the index
+// names), so its bytes and name are synced.
+//
+// A failed step is reported, never thrown: the callers are handling the
+// corruption, and the next open() must still reset. The poison's
+// existence is what resets, so after a failed write or sync it is placed
+// still, and when it cannot be created or renamed it is created in place.
+// ENOENT means a replaced cache, whose directory is gone and the poison
+// with it: nothing is left to reset.
 void PackCas::poison(std::string_view why) {
   auto &impl = *impl_;
+  const std::string line = std::string(why) + "\n";
   const std::string tmp = "poison." + std::to_string(getpid()) + ".tmp";
-  const int fd =
-      impl.open_in_dir(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
-  if (fd < 0) {
-    return; // a replaced cache: nothing left to reset
-  }
-  try {
-    write_all(fd, std::string(why) + "\n");
-  } catch (...) {
+  const auto failed = [&](const char *step, int err) {
+    report_poison_failure(impl.dir, step, err);
+  };
+  bool placed = false;
+  if (const int fd =
+          impl.open_in_dir(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC);
+      fd < 0) {
+    if (errno == ENOENT) {
+      return;
+    }
+    failed("create the poison", errno);
+  } else {
+    try {
+      write_all(fd, line);
+    } catch (const std::system_error &err) {
+      failed("write the poison", err.code().value());
+    }
+    if (fsync(fd) < 0) {
+      failed("sync the poison", errno);
+    }
     close(fd);
-    unlinkat(impl.dir_fd, tmp.c_str(), 0);
-    throw;
+    if (renameat(impl.dir_fd, tmp.c_str(), impl.dir_fd, "poison") == 0) {
+      placed = true;
+    } else {
+      const int err = errno;
+      unlinkat(impl.dir_fd, tmp.c_str(), 0);
+      if (err == ENOENT) {
+        return;
+      }
+      failed("rename the poison into place", err);
+    }
   }
-  close(fd);
-  if (renameat(impl.dir_fd, tmp.c_str(), impl.dir_fd, "poison") < 0) {
-    unlinkat(impl.dir_fd, tmp.c_str(), 0);
+  if (!placed) {
+    const int fd = impl.open_in_dir("poison", O_WRONLY | O_CREAT | O_CLOEXEC);
+    if (fd < 0) {
+      failed("create the poison in place", errno);
+      return;
+    }
+    if (write(fd, line.data(), line.size()) < 0 || fsync(fd) < 0) {
+      failed("write the poison in place", errno);
+    }
+    close(fd);
+  }
+  if (fsync(impl.dir_fd) < 0) {
+    failed("sync the cache directory", errno);
   }
 }
 
@@ -1187,10 +1242,19 @@ void PackCas::compact(const std::function<bool(std::string_view)> &live) {
     }
     impl.write_gen(txn.get(), gen + 1);
     txn.commit();
-    mdb_check(mdb_env_sync(impl.env, 1), "env_sync");
-
+    // the index names the new pack: a failure from here on keeps it, as
+    // removing it lets the next batch recreate it empty under that index
     close(new_fd);
     new_fd = -1;
+    // Linux reports a failed writeback once and may drop the unwritten
+    // pages, so a later sync can succeed and remove the marker over index
+    // pages that never reached the disk: the next open resets instead
+    if (const int res = mdb_env_sync(impl.env, 1); res != MDB_SUCCESS) {
+      poison(std::string("the compacted index's flush failed: ") +
+             mdb_strerror(res));
+      mdb_check(res, "env_sync compaction");
+    }
+
     unlinkat(impl.dir_fd, Impl::pack_name(gen).c_str(), 0);
     impl.mapping_for(gen + 1, true);
     impl.committed_end = impl.end = new_off;
