@@ -12,6 +12,31 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/mman.h>
+
+// Nothing here crashes the machine, so nothing this test checks depends on
+// a sync reaching the disk: what a reopen must find, and what a drop
+// without sync may lose, is the same in the page cache. On a filesystem
+// whose journal is busy each sync waits for a commit, and the ~100k syncs
+// of a run were nearly all of its time, so they return at once here.
+// crash_test checks which syncs the cache issues.
+static unsigned long syncs = 0;
+extern "C" __attribute__((visibility("default"))) int fsync(int /*fd*/) {
+  syncs++;
+  return 0;
+}
+extern "C" __attribute__((visibility("default"))) int fdatasync(int /*fd*/) {
+  syncs++;
+  return 0;
+}
+extern "C" __attribute__((visibility("default"))) int
+msync(void * /*addr*/, size_t /*len*/, int /*flags*/) {
+  syncs++;
+  return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
   std::string dir = argc > 1 ? argv[1] : make_test_dir("packcas-model-test");
   uint64_t seed = argc > 2 ? std::stoull(argv[2]) : 1;
@@ -113,6 +138,10 @@ int main(int argc, char **argv) {
     std::string out;
     assert(cas->get(hash, out) && out == data);
   }
+#ifdef __linux__
+  // the stubs above are the ones the cache called
+  assert(syncs > 0);
+#endif
   printf("model test ok: %zu blobs\n", model.size());
   return 0;
 }
