@@ -875,7 +875,8 @@ void writes_after_reset(const std::string &dir) {
   assert(throws_replaced([&] { (void)stale->put("after the reset"); }));
   assert(throws_replaced([&] { stale->meta_put("record", "after"); }));
   assert(throws_replaced([&] { stale->meta_del("record"); }));
-  assert(stale->has(before));
+  std::string held;
+  assert(stale->get(before, held) && held == "before the reset");
   assert(throws_replaced([&] { stale->check_live(); }));
   stale.reset();
   auto fresh = PackCas::open(dir);
