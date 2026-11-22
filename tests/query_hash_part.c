@@ -1,11 +1,14 @@
-// query_hash_part STORE_URI: a C API client that keeps a store open, as a
-// daemon or a program serving a store does. For each hash part read from
-// stdin it prints one line: "path <name>", "none", or "error <message>".
+// query_hash_part STORE_URI [STATUS]: a C API client that keeps a store
+// open, as a daemon or a program serving a store does. For each hash part
+// read from stdin it prints one line: "path <name>", "none", or
+// "error <message>". At end of input it prints "done", left to exit(3) to
+// flush, and exits with STATUS (default 0).
 #include <nix_api_main.h>
 #include <nix_api_store.h>
 #include <nix_api_util.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void print_name(const char *start, unsigned int n, void *user_data) {
@@ -14,8 +17,8 @@ static void print_name(const char *start, unsigned int n, void *user_data) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s STORE_URI\n", argv[0]);
+  if (argc != 2 && argc != 3) {
+    fprintf(stderr, "usage: %s STORE_URI [STATUS]\n", argv[0]);
     return 2;
   }
   nix_c_context *ctx = nix_c_context_create();
@@ -44,5 +47,6 @@ int main(int argc, char **argv) {
   }
   nix_store_free(store);
   nix_c_context_free(ctx);
-  return 0;
+  printf("done\n");
+  return argc == 3 ? atoi(argv[2]) : 0;
 }
