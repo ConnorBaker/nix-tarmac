@@ -120,7 +120,9 @@ int main(int argc, char **argv) {
   printf("evicted %zu of %zu cold roots\n", evicted, roots.size());
   assert(evicted == roots.size());
 
-  assert(store.cas().has(warm_blob));
+  std::string warm;
+  assert(store.cas().get(warm_blob, warm) &&
+         warm == "blob kept alive by touch");
   assert(!store.cas().has(cold_blob));
 
   auto again = ingest(store, 1);
