@@ -22,6 +22,7 @@
 
 struct Ctx {
   std::mutex mutex; // single writer; reads are lock-free
+  std::once_flag exitChecked; // plugin/store.cc checkAtExit
   std::string dir;
   TreeStore store;
 
