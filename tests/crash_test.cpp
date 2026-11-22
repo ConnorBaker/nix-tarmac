@@ -14,10 +14,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
 #include <chrono>
+#include <climits>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -27,6 +29,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <tuple>
 #include <vector>
@@ -65,19 +68,80 @@ static int fail_dbi_open_with = 0;
 // while set, opening the boot id fails, as where /proc is missing
 // (macOS): boot_id() then comes back empty
 static bool hide_boot_id = false;
+static constexpr const char *kBootId = "/proc/sys/kernel/random/boot_id";
+// While it names a directory, a program this process execs must hold no
+// fd on a file under it, nor on the boot id: after each open(2) or
+// openat(2) that opened one, after each fopen(3), before each
+// fdopendir(3), and where a test calls exec_probe(), a child execs this
+// test with --held-fds, which lists /proc/self/fd. Each point stands for
+// another thread's exec then. liblmdb's own opens call open, not the
+// open64 defined below, so they are not points: LMDB's data.mdb gets
+// FD_CLOEXEC only once mdb_env_open has returned.
+static std::string exec_probe_root;
+static unsigned exec_probes = 0;
+static void exec_probe(const char *event) {
+  if (exec_probe_root.empty()) {
+    return;
+  }
+  const char *argv[] = {"crash_test", "--held-fds", exec_probe_root.c_str(),
+                        nullptr};
+  const pid_t pid = fork();
+  if (pid == 0) {
+    execv("/proc/self/exe", const_cast<char *const *>(argv));
+    _exit(127);
+  }
+  int st = 0;
+  if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) ||
+      WEXITSTATUS(st) != 0) {
+    fprintf(stderr, "a program exec'd at %s holds a cache fd\n", event);
+    abort();
+  }
+  exec_probes++;
+}
+// the --held-fds child: fails, naming them, if it holds such fds
+static int held_fds(const char *root) {
+  const std::string under = std::string(root) + "/";
+  DIR *fds = opendir("/proc/self/fd");
+  if (fds == nullptr) {
+    perror("/proc/self/fd");
+    return 2;
+  }
+  int held = 0;
+  while (const dirent *entry = readdir(fds)) {
+    std::array<char, 4096> target{};
+    const std::string link = std::string("/proc/self/fd/") + entry->d_name;
+    const ssize_t len =
+        readlink(link.c_str(), target.data(), target.size() - 1);
+    if (len <= 0) {
+      continue;
+    }
+    const std::string_view path(target.data(), static_cast<size_t>(len));
+    if (path.starts_with(under) || path == kBootId) {
+      fprintf(stderr, "exec'd with fd %s: %.*s\n", entry->d_name,
+              static_cast<int>(path.size()), path.data());
+      held++;
+    }
+  }
+  closedir(fds);
+  return held == 0 ? 0 : 1;
+}
 static FILE *fopen_unless_boot_id(const char *name, const char *path,
                                   const char *mode) {
-  if (hide_boot_id && strcmp(path, "/proc/sys/kernel/random/boot_id") == 0) {
+  if (hide_boot_id && strcmp(path, kBootId) == 0) {
     errno = ENOENT;
     return nullptr;
   }
   auto *real = reinterpret_cast<FILE *(*)(const char *, const char *)>(
       dlsym(RTLD_NEXT, name));
-  return real(path, mode);
+  FILE *file = real(path, mode);
+  if (file != nullptr) {
+    exec_probe("an fopen");
+  }
+  return file;
 }
-// boot_id()'s std::ifstream opens it through libstdc++'s fopen, which
-// under _FILE_OFFSET_BITS=64 may be spelled fopen64; each definition
-// names its symbol
+// a std::ifstream opens its file through libstdc++'s fopen, which under
+// _FILE_OFFSET_BITS=64 may be spelled fopen64; each definition names its
+// symbol
 extern "C" __attribute__((visibility("default"))) FILE *
 fopen_hook(const char *path, const char *mode) __asm__("fopen");
 extern "C" FILE *fopen_hook(const char *path, const char *mode) {
@@ -112,7 +176,7 @@ static std::string unnamed;
 static auto names_in(int dir_fd) -> std::vector<DurableName> {
   std::vector<DurableName> names;
   struct stat dir_st {};
-  const int list_fd = dup(dir_fd);
+  const int list_fd = fcntl(dir_fd, F_DUPFD_CLOEXEC, 0);
   DIR *listing = list_fd < 0 ? nullptr : fdopendir(list_fd);
   if (fstat(dir_fd, &dir_st) != 0 || listing == nullptr) {
     if (listing != nullptr) {
@@ -255,6 +319,10 @@ static int open_or_fail(int dir_fd, const char *path, int flags, va_list ap) {
   const mode_t mode = (flags & (O_CREAT | O_TMPFILE)) != 0
                           ? static_cast<mode_t>(va_arg(ap, int))
                           : 0;
+  if (hide_boot_id && strcmp(path, kBootId) == 0) {
+    errno = ENOENT;
+    return -1;
+  }
   const size_t len = strlen(path);
   if (const char *suffix = fail_open_suffix;
       suffix != nullptr && len >= strlen(suffix) &&
@@ -263,7 +331,12 @@ static int open_or_fail(int dir_fd, const char *path, int flags, va_list ap) {
     errno = fail_open_errno;
     return -1;
   }
-  return static_cast<int>(syscall(SYS_openat, dir_fd, path, flags, mode));
+  const int fd =
+      static_cast<int>(syscall(SYS_openat, dir_fd, path, flags, mode));
+  if (fd >= 0) {
+    exec_probe("an open");
+  }
+  return fd;
 }
 // with _FILE_OFFSET_BITS=64, as meson builds, this defines open64
 extern "C" __attribute__((visibility("default"))) int open(const char *path,
@@ -987,6 +1060,14 @@ unlinkat(int dirfd, const char *path, int flags) noexcept {
   }
   return static_cast<int>(syscall(SYS_unlinkat, dirfd, path, flags));
 }
+// fdopendir(3) sets FD_CLOEXEC on the fd it is given, so the point is
+// before it: the fd as its caller dup'd it
+extern "C" __attribute__((visibility("default"))) DIR *fdopendir(int fd) {
+  exec_probe("an fdopendir");
+  static auto *const real =
+      reinterpret_cast<DIR *(*)(int)>(dlsym(RTLD_NEXT, "fdopendir"));
+  return real(fd);
+}
 
 static std::string partial_dir;
 void open_during_remove() {
@@ -1362,9 +1443,56 @@ void boot_id_less_commit(const std::string &dir) {
   }
   printf("boot-id-less commit ok\n");
 }
+
+// A program a cache's process execs holds none of the cache's fds, at any
+// point of open(), a batch, a commit, a compaction, a poison or the reset
+// it brings: none, LMDB's data.mdb among them, lacks FD_CLOEXEC
+void exec_holds_no_cache_fd(const std::string &root) {
+  const std::string dir = root + "/cache";
+  assert(mkdir(root.c_str(), 0755) == 0);
+  {
+    auto cas = PackCas::open(dir);
+    (void)cas->put(std::string(5000, 'a'));
+    cas->sync();
+  }
+  std::array<char, PATH_MAX> resolved{};
+  assert(realpath(root.c_str(), resolved.data()) != nullptr);
+  exec_probe_root = resolved.data();
+  exec_probe("a test's start");
+  const unsigned before_open = exec_probes;
+  auto cas = PackCas::open(dir);
+  const unsigned in_open = exec_probes - before_open;
+  exec_probe("an open cache");
+  (void)cas->put(std::string(5000, 'b'));
+  exec_probe("an open batch");
+  cas->commit(); // writes the unsynced marker
+  (void)cas->put(std::string(5000, 'c'));
+  cas->commit(); // reads it
+  cas.reset();
+  cas = PackCas::open(dir); // reads it
+  assert(access((dir + "/unsynced").c_str(), F_OK) == 0);
+  exec_probe("a reopened cache");
+  cas->compact([](std::string_view) { return true; });
+  exec_probe("a compacted cache");
+  cas->poison("exec probe"); // writes poison.tmp
+  cas.reset();
+  cas = PackCas::open(dir); // reads the poison, and resets under the lock
+  assert(access((dir + "/poison").c_str(), F_OK) != 0);
+  exec_probe("a reset cache");
+  cas.reset();
+  exec_probe_root.clear();
+  // open()'s own points: the boot id's, the lock's and the pack's opens
+  assert(in_open >= 3);
+  printf("exec holds no cache fd ok: %u exec probes\n", exec_probes);
+}
 #endif
 
 int main(int argc, char **argv) {
+#ifdef __linux__
+  if (argc == 3 && strcmp(argv[1], "--held-fds") == 0) {
+    return held_fds(argv[2]);
+  }
+#endif
   std::string dir = argc > 1 ? argv[1] : make_test_dir("packcas-crash-test");
   concurrent_writers(dir);
   crash_recovery(dir);
@@ -1389,6 +1517,7 @@ int main(int argc, char **argv) {
   lmdb_codes(dir + "/lmdb-codes-test");
   pack_durable_before_index(dir + "/durable-test");
   boot_id_less_commit(dir + "/bootless-test");
+  exec_holds_no_cache_fd(dir + "/exec-test");
 #endif
   return 0;
 }

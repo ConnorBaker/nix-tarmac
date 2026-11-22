@@ -23,10 +23,10 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -53,14 +53,6 @@ auto data_sync(int fd) -> int {
 #else
   return fdatasync(fd);
 #endif
-}
-
-// empty where the kernel exposes none; commit() then syncs
-auto boot_id() -> std::string {
-  std::ifstream in("/proc/sys/kernel/random/boot_id");
-  std::string id;
-  std::getline(in, id);
-  return id;
 }
 
 constexpr size_t kMapSize = 1UL << 40;
@@ -332,6 +324,51 @@ auto open_file(const std::string &path, int flags) -> int {
 auto open_at(int dir_fd, const std::string &name, int flags) -> int {
   // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): openat(2) is variadic
   return ::openat(dir_fd, name.c_str(), flags, kFileMode);
+}
+
+// A program exec'd from this process inherits every fd without
+// FD_CLOEXEC, whichever thread opened it: the build hook's and git's for
+// fetches (before Nix 2.36), and what nix run, develop and shell exec. So
+// each fd here has it from its open (std::ifstream's fopen() sets none)
+
+// the file's first line, or nullopt if it cannot be read
+auto first_line(const std::string &path) -> std::optional<std::string> {
+  const int fd = open_file(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return std::nullopt;
+  }
+  std::string line;
+  std::array<char, 64> buf{};
+  for (;;) {
+    const ssize_t got = read(fd, buf.data(), buf.size());
+    if (got < 0 && errno == EINTR) {
+      continue;
+    }
+    if (got < 0) {
+      close(fd);
+      return std::nullopt;
+    }
+    if (got == 0) {
+      break;
+    }
+    line.append(buf.data(), static_cast<size_t>(got));
+    if (const size_t end = line.find('\n'); end != std::string::npos) {
+      line.resize(end);
+      break;
+    }
+  }
+  close(fd);
+  return line;
+}
+
+auto dup_cloexec(int fd) -> int {
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-vararg): fcntl(2) is variadic
+  return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+}
+
+// empty where the kernel exposes none; commit() then syncs
+auto boot_id() -> std::string {
+  return first_line("/proc/sys/kernel/random/boot_id").value_or("");
 }
 
 void wait_flock(int lock_fd) {
@@ -710,9 +747,7 @@ struct PackCas::Impl {
   // cache whose marker names another boot
   void mark_unsynced() const {
     const std::string path = dir + "/unsynced";
-    std::ifstream marker(path);
-    if (std::string id;
-        boot.empty() || (std::getline(marker, id) && id == boot)) {
+    if (boot.empty() || first_line(path) == boot) {
       return;
     }
     // a rename: the marker is never empty or partial
@@ -815,7 +850,7 @@ struct PackCas::Impl {
 
   // only safe with the writer lock
   void cleanup_orphans(uint64_t live_gen) const {
-    const int list_fd = dup(dir_fd);
+    const int list_fd = dup_cloexec(dir_fd);
     if (list_fd < 0) {
       sys_err("dup " + dir);
     }
@@ -907,7 +942,7 @@ auto PackCas::open_once(const std::string &dir, bool &reset)
   if (impl->dir_fd < 0) {
     sys_err("open " + dir);
   }
-  const int opened = dup(impl->dir_fd);
+  const int opened = dup_cloexec(impl->dir_fd);
   if (opened < 0) {
     sys_err("dup " + dir);
   }
@@ -971,9 +1006,8 @@ auto PackCas::open_files(std::unique_ptr<Impl> impl, const std::string &dir)
   if (impl->lock_fd < 0) {
     sys_err("open " + dir + "/lock");
   }
-  if (std::ifstream marker(dir + "/unsynced"); marker) {
-    std::string id;
-    std::getline(marker, id);
+  if (const auto marker = first_line(dir + "/unsynced")) {
+    const std::string &id = *marker;
     // empty: no commit followed, it waits for the marker's fsync
     if (!id.empty() && id != boot_id()) {
       throw CorruptError("unsynced writes lost by an unclean shutdown");
@@ -992,6 +1026,17 @@ auto PackCas::open_files(std::unique_ptr<Impl> impl, const std::string &dir)
   mdb_check(mdb_env_open(impl->env, idx_dir.c_str(),
                          sync_flag | MDB_WRITEMAP | MDB_NOTLS, kFileMode),
             "env_open");
+  // LMDB opens its other fds with O_CLOEXEC but leaves it off the data
+  // file's, for a caller to close after fork() (lmdb.h, mdb_env_get_fd):
+  // without it each program the process execs holds data.mdb open
+  mdb_filehandle_t data_fd = -1;
+  mdb_check(mdb_env_get_fd(impl->env, &data_fd), "env_get_fd");
+  // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg): fcntl(2) is variadic
+  if (const int fd_flags = fcntl(data_fd, F_GETFD);
+      fd_flags < 0 || fcntl(data_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+    sys_err("set close-on-exec on " + idx_dir + "/data.mdb");
+  }
+  // NOLINTEND(cppcoreguidelines-pro-type-vararg)
   MDB_txn *txn = nullptr;
   begin_write(impl->env, &txn);
   uint64_t gen = 0;
