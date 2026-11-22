@@ -34,10 +34,15 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unistd.h>
+#include <vector>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -250,6 +255,63 @@ struct TarmacStoreConfig : std::enable_shared_from_this<TarmacStoreConfig>,
   }
 };
 
+// A process that took a path from the eval store, by writing it or finding
+// it valid, may print it. If a reset replaced the cache since, no later
+// process finds that path, and a check in a store call cannot see a reset
+// that lands between calls, after the process last used the store. So
+// such a process checks at exit, and fails if its cache was replaced.
+// Nix gives a plugin no exit status to set: the check runs as an exit
+// handler and ends the process with _exit, after flushing what exit(3)
+// would have flushed. glibc's on_exit(3) passes the handler the status the
+// process is exiting with, and a failure's own status is kept (as exit(3)
+// keeps it, its low 8 bits: 256 would exit 0, and becomes 1); elsewhere,
+// atexit(3) does not, and the status is 1. A reset after the check is one
+// after the exit, which removes the path just the same, so nothing is held
+// through the exit.
+std::mutex &exitCheckMutex() {
+  static auto *mutex = new std::mutex; // never destroyed: used at exit
+  return *mutex;
+}
+
+std::vector<std::shared_ptr<Ctx>> &exitChecked() {
+  static auto *caches = new std::vector<std::shared_ptr<Ctx>>;
+  return *caches;
+}
+
+// status: the process's exit status, or 0 where it is unknown
+void failIfReplacedAtExit(int status) {
+  const std::scoped_lock lock(exitCheckMutex());
+  for (const auto &ctx : exitChecked()) {
+    try {
+      ctx->store.cas().check_live();
+    } catch (const ReplacedError &err) {
+      std::cout.flush();
+      fflush(nullptr);
+      fprintf(stderr,
+              "error: %s; the paths this process took from it, such as the "
+              "derivations it printed, are gone with it. Build outputs, in "
+              "the build store, are not affected and may still be valid\n",
+              err.what());
+      _exit((status & 0xff) != 0 ? status : 1);
+    }
+  }
+}
+
+void checkAtExit(const std::shared_ptr<Ctx> &ctx) {
+  std::call_once(ctx->exitChecked, [&] {
+    const std::scoped_lock lock(exitCheckMutex());
+    if (exitChecked().empty()) {
+#ifdef __GLIBC__
+      on_exit([](int status, void * /*arg*/) { failIfReplacedAtExit(status); },
+              nullptr);
+#else
+      std::atexit([] { failIfReplacedAtExit(0); });
+#endif
+    }
+    exitChecked().push_back(ctx);
+  });
+}
+
 struct TarmacStore : nix::Store {
   using Config = TarmacStoreConfig;
 
@@ -305,6 +367,7 @@ struct TarmacStore : nix::Store {
       return std::nullopt;
     }
     state->store.cas().check_live();
+    checkAtExit(state);
     state->store.touchRoot(rec.root_id, rec.root_type == 'd');
     return rec;
   }
@@ -320,6 +383,7 @@ struct TarmacStore : nix::Store {
       return std::nullopt;
     }
     state->store.cas().check_live();
+    checkAtExit(state);
     state->store.touchRoot(*id, false);
     return text;
   }
@@ -410,6 +474,7 @@ struct TarmacStore : nix::Store {
     }
     if (res) {
       state->store.cas().check_live();
+      checkAtExit(state);
     }
     return res;
   }
@@ -438,6 +503,7 @@ struct TarmacStore : nix::Store {
     metaPut(kPathPrefix, info.path, rec.encode());
     // commit promptly, the writer flock blocks other eval workers
     state->store.cas().commit();
+    checkAtExit(state);
   }
 
   void addToStore(const nix::ValidPathInfo &info, nix::Source &source,
@@ -501,6 +567,7 @@ struct TarmacStore : nix::Store {
       state->store.registerRoot(id, false);
       metaPut(kDrvPrefix, drvPath, id);
       state->store.cas().commit();
+      checkAtExit(state);
     }
     return drvPath;
   }
