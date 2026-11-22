@@ -74,7 +74,6 @@ int main(int argc, char **argv) {
   assert(w.lookup(res.root, "link", e) && e.type == 's');
   assert(!w.lookup(res.root, "sub/missing", e));
   assert(!w.lookup(res.root, "file/nope", e));
-  assert(store.readBlob(e.id).empty() == false || true);
 
   printf("nar test ok: %s\n", h.c_str());
   return 0;
