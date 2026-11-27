@@ -57,6 +57,13 @@ inline auto unparseDrv(const nix::StoreDirConfig &store,
 #endif
 }
 
+// Whether a file name names a derivation. NixOS/nix renamed
+// nix::isDerivation(std::string_view) to isDerivationFileName (b60d550b) with
+// no version bump, so this is its body, the same before and after.
+inline auto isDerivationFileName(std::string_view name) -> bool {
+  return name.ends_with(nix::drvExtension);
+}
+
 // store paths a .drv refers to (input sources and input derivations)
 inline auto drvReferences(const nix::Derivation &drv) -> nix::StorePathSet {
 #if TARMAC_NIX_AT_LEAST(2, 36)

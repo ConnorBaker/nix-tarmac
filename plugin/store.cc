@@ -453,7 +453,7 @@ struct TarmacStore : nix::Store {
                           nix::HashAlgorithm hashAlgo,
                           const nix::StorePathSet &references,
                           nix::RepairFlag repair) -> nix::StorePath override {
-    if (nix::isDerivation(name)) {
+    if (nix_compat::isDerivationFileName(name)) {
       throw nix::Error(
           "refusing to add derivation '%s' with addToStoreFromDump", name);
     }
