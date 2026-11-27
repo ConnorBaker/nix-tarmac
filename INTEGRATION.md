@@ -37,11 +37,12 @@ Base `main` commit: `8ae9fd6b69568abd4bf3a060e04f3b5fc8493a33`
 | 20 | `tests-compare-read-bytes` | `5efb60fe0c1b3a77c0da47583d768bd67e267d97` | `refuse-replaced-cache` |  | Tests compare blobs read back with the bytes stored |  |
 | 21 | `exit-fails-after-reset` | `14ee0425ed8fccf3000274203159492f9a76bb9f` | `refuse-replaced-cache` |  | Fail at exit when a reset replaced the cache a path came from |  |
 | 22 | `cloexec-cache-fds` | `885bd52f685fa67dc8d0360c7000c21e822787a8` | `compact-dir-fsync`, `refuse-replaced-cache` | sets close-on-exec on descriptors opened by code of each of the three | Close-on-exec on every fd a cache holds |  |
+| 23 | `is-derivation-file-name` | `a5380140039fcef59e80cafa7de0f26d3f46e88b` |  |  | addToStoreFromDump checks the name's .drv suffix itself: NixOS/nix renamed nix::isDerivation(std::string_view) to isDerivationFileName without a version bump |  |
 
 Already merged before the first row (by the merges at the start of this branch): `query-valid-paths` (`4c75afafc4`), `clear-dead-readers` (`88847c4228`).
 
 
-7 of 22 merges resolve overlaps; each names its files in its message.
+8 of 23 merges resolve overlaps; each names its files in its message.
 
 The `integration: describe the merged branches` commit only adds or updates this file and `maintainers/integration-status.sh`.
 
