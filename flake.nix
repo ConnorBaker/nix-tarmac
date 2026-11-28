@@ -74,6 +74,7 @@
             after-reset
             c-api-after-reset
             fetch-error
+            fetch-tree-git
             ;
 
           # The tests as the deploy builds them: nix-optimization's tarmac.nix
