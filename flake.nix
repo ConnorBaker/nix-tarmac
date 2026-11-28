@@ -69,7 +69,12 @@
         }
         // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
           # Linux: strace, and the sandbox these scripts were run in
-          inherit (scope) one-cache after-reset c-api-after-reset;
+          inherit (scope)
+            one-cache
+            after-reset
+            c-api-after-reset
+            fetch-error
+            ;
 
           # The tests as the deploy builds them: nix-optimization's tarmac.nix
           # builds Tarmac with llvmPackages_22.stdenv (to match its Clang-built
