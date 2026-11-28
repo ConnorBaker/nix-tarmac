@@ -85,10 +85,11 @@ public:
       throw nix::Error("path '%s' is not a directory", path);
     }
     DirEntries res;
-    for (const auto &child : healing([&]() -> std::vector<TreeEntry> {
+    for (auto &child : healing([&]() -> std::vector<TreeEntry> {
            return store_->readTree(entry->id);
          })) {
-      res.emplace(child.name, tarmac_entry_type(child.type));
+      res.emplace(nix_compat::dirEntryName(std::move(child.name)),
+                  tarmac_entry_type(child.type));
     }
     return res;
   }

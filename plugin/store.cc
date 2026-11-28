@@ -107,7 +107,8 @@ auto ingest(TreeStore &tree, const nix::MemorySourceAccessor::File &file)
                           entries.reserve(dir.entries.size());
                           for (const auto &[name, child] : dir.entries) {
                             auto [type, id] = ingest(tree, child);
-                            entries.push_back({name, type, std::move(id)});
+                            entries.push_back({nix_compat::dirEntryString(name),
+                                               type, std::move(id)});
                           }
                           return {'d', tree.putTree(entries)};
                         },
