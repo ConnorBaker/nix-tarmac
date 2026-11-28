@@ -60,6 +60,15 @@ constexpr size_t kHashBufSize = 1 << 16;
 // chunks this big are hashed directly instead of being copied into the buffer
 constexpr size_t kHashDirectThreshold = 256;
 
+// One file name, as nix::Filename (nix/util/filename.hh) requires: not
+// empty, '.' or '..', and without '/' or NUL. Every name tarmac stores is
+// one: split_path drops the other components of a tarball's paths, and Nix
+// names directory entries with nix::Filename.
+auto is_file_name(std::string_view name) -> bool {
+  return !name.empty() && name != "." && name != ".." && !name.contains('/') &&
+         !name.contains('\0');
+}
+
 } // namespace
 
 auto to_hex(std::string_view raw) -> std::string {
@@ -390,6 +399,9 @@ auto TreeStore::readTree(const std::string &tree_id) -> std::vector<TreeEntry> {
       throw CorruptError("corrupt tree object: truncated");
     }
     entry.name = std::string(buf.substr(pos, name_len));
+    if (!is_file_name(entry.name)) {
+      throw CorruptError("corrupt tree object: bad name");
+    }
     pos += name_len;
     const auto id_len = static_cast<uint8_t>(buf[pos++]);
     if (pos + id_len > buf.size()) {

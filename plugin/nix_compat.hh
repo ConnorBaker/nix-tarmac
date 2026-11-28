@@ -10,9 +10,11 @@
 #include <nix/util/file-content-address.hh>
 #include <nix/util/memory-source-accessor.hh>
 #include <nix/util/serialise.hh>
+#include <nix/util/source-accessor.hh>
 
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 #define TARMAC_NIX_AT_LEAST(major, minor)                                      \
@@ -117,5 +119,31 @@ inline auto drvReferences(const nix::Derivation &drv) -> nix::StorePathSet {
 #endif
 }
 #endif
+
+// NixOS/nix 7569dc8726 named directory entries with nix::Filename, a string
+// that is one file name, instead of std::string, with no version bump. The
+// key type is detected; Name is a template parameter only so that the branch
+// not taken is dependent and never instantiated.
+
+// The DirEntries key for a tree entry's name. readTree refuses a name that is
+// not one file name, so it is known valid: Nix's asserting constructor.
+template <typename Name = nix::SourceAccessor::DirEntries::key_type>
+auto dirEntryName(std::string name) -> Name {
+  if constexpr (std::is_same_v<Name, std::string>) {
+    return name;
+  } else {
+    return Name::fromStringAsserting(std::move(name));
+  }
+}
+
+// The string of a directory entry's name, a nix::Filename or a std::string.
+template <typename Name>
+auto dirEntryString(const Name &name) -> const std::string & {
+  if constexpr (std::is_same_v<Name, std::string>) {
+    return name;
+  } else {
+    return name.str();
+  }
+}
 
 } // namespace nix_compat

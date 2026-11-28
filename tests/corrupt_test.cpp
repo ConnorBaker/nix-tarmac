@@ -2,6 +2,7 @@
 #include "test_tmp.hpp"
 
 #include "pack_cas.hpp"
+#include "tree.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -11,6 +12,7 @@
 #include <exception>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 int main(int argc, char **argv) {
@@ -117,6 +119,31 @@ int main(int argc, char **argv) {
     std::string out;
     assert(cas->get(h, out) && out == "fresh start");
     printf("self-heal ok\n");
+  }
+
+  // a tree entry's name must be one file name: every name tarmac writes is
+  // one (a tarball's paths are split at '/', and Nix names directory entries
+  // with nix::Filename), so any other is a corrupt tree object, refused
+  // before it reaches a NAR or a directory listing
+  {
+    TreeStore store(PackCas::open(dir + "/names"));
+    const std::string blob = store.putBlob("x");
+    auto read_one = [&](const std::string &name) -> bool {
+      const std::string tree = store.putTree({{name, 'r', blob}});
+      try {
+        (void)store.readTree(tree);
+        return true;
+      } catch (const CorruptError &) {
+        return false;
+      }
+    };
+    for (const char *name : {"a", "...", ".a", "a b", "~nix~case~hack~1"})
+      assert(read_one(name));
+    for (const std::string &name :
+         {std::string(), std::string("."), std::string(".."),
+          std::string("a/b"), std::string("/"), std::string("a\0b", 3)})
+      assert(!read_one(name));
+    printf("tree entry names ok\n");
   }
   return 0;
 }
