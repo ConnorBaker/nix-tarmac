@@ -38,11 +38,13 @@ Base `main` commit: `8ae9fd6b69568abd4bf3a060e04f3b5fc8493a33`
 | 21 | `exit-fails-after-reset` | `14ee0425ed8fccf3000274203159492f9a76bb9f` | `refuse-replaced-cache` |  | Fail at exit when a reset replaced the cache a path came from |  |
 | 22 | `cloexec-cache-fds` | `885bd52f685fa67dc8d0360c7000c21e822787a8` | `compact-dir-fsync`, `refuse-replaced-cache` | sets close-on-exec on descriptors opened by code of each of the three | Close-on-exec on every fd a cache holds |  |
 | 23 | `is-derivation-file-name` | `a5380140039fcef59e80cafa7de0f26d3f46e88b` |  |  | addToStoreFromDump checks the name's .drv suffix itself: NixOS/nix renamed nix::isDerivation(std::string_view) to isDerivationFileName without a version bump |  |
+| 24 | `fetch-error` | `8cb49d4190b611394e3a26819197af6f696de28f` | `integration` at `e501b55` |  | A failed tarball download reports the download's error (the exception from the Source), not libarchive's "Truncated tar archive"; with its fetch-error check. Its commits sit on this branch at `e501b55`, not on `main`; they change no file that this branch changes after `e501b55` |  |
+| 25 | `filename-entries` | `455c6bf86c7905115db4ffb0eaf7268c244e2d3d` |  |  | readTree refuses a tree entry name that is not one file name (empty, `.`, `..`, or containing `/` or NUL) as a corrupt tree object; the plugin keys directory entries by nix::Filename where Nix does (NixOS/nix 7569dc8726, no version bump; the key type is detected) |  |
 
 Already merged before the first row (by the merges at the start of this branch): `query-valid-paths` (`4c75afafc4`), `clear-dead-readers` (`88847c4228`).
 
 
-8 of 23 merges resolve overlaps; each names its files in its message.
+9 of 25 merges resolve overlaps; each names its files in its message.
 
 The `integration: describe the merged branches` commit only adds or updates this file and `maintainers/integration-status.sh`.
 
