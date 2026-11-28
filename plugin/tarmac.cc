@@ -77,13 +77,27 @@ public:
     } catch (nix::EndOfFile &) {
       return 0;
     } catch (...) {
+      self->error_ = std::current_exception();
       return -1;
+    }
+  }
+
+  // libarchive reports a failed read as its own error about the archive
+  // ("Truncated tar archive detected while reading data"), so a failed
+  // download would surface as a damaged tarball. Like nix::TarArchive's
+  // readException, rethrow the source's own error instead. Call it only
+  // once no thread can still be reading (ingest_archive has joined its
+  // reader).
+  void rethrowReadError() const {
+    if (error_) {
+      std::rethrow_exception(error_);
     }
   }
 
 private:
   nix::Source *source_;
   std::vector<char> buf_ = std::vector<char>(kDownloadChunk);
+  std::exception_ptr error_;
 };
 
 auto has_tarball_extension(const nix::ParsedURL &url) -> bool {
@@ -109,6 +123,7 @@ auto open_archive(nix::Source &source, const std::string &url)
     const char *msg = archive_error_string(arc);
     const std::string err = msg != nullptr ? msg : "unknown archive error";
     archive_read_free(arc);
+    reader->rethrowReadError();
     throw nix::Error("failed to read tarball '%s': %s", url, err);
   }
   return {arc, std::move(reader)};
@@ -307,7 +322,14 @@ private:
 
     const std::scoped_lock lock(ctx.mutex);
     auto [arc, reader] = open_archive(*source, url);
-    auto ingest = ingest_archive(ctx.store, arc);
+    auto ingest = [&] -> IngestResult {
+      try {
+        return ingest_archive(ctx.store, arc);
+      } catch (...) {
+        reader->rethrowReadError();
+        throw;
+      }
+    }();
     // like the builtin: a single top-level directory is stripped
     if (auto top = ctx.store.readTree(ingest.root);
         top.size() == 1 && top[0].type == 'd') {

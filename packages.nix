@@ -85,6 +85,12 @@ lib.makeScope newScope (
       plugin = self.default;
     };
 
+    # a failed tarball download reports the download's error
+    fetch-error = self.callPackage ./tests/fetch-error.nix {
+      nix = nixVersions.latest;
+      plugin = self.default;
+    };
+
     # an evaluation spanning a reset of its eval store fails
     after-reset = self.callPackage ./tests/after-reset.nix {
       nix = nixVersions.latest;
