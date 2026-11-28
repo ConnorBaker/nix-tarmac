@@ -103,6 +103,17 @@ lib.makeScope newScope (
       plugin = self.default;
     };
 
+    # a fetched tree read through the plugin's accessor is the builtin
+    # fetcher's, under the git-pinned Nix (its directory entries' API is
+    # the newest the plugin is built for)
+    fetch-tree-git = self.callPackage ./tests/fetch-tree.nix {
+      plugin = self.versionPlugins.plugin-git;
+      # that Nix without its own unit and functional suites as a build
+      # gate: they are Nix's checks, not the plugin's, and nixpkgs'
+      # recipes for them can lag behind the pinned Nix's needs
+      nix = self.versionPlugins.plugin-git.nix.overrideAttrs { doCheck = false; };
+    };
+
     # an evaluation spanning a reset of its eval store fails
     after-reset = self.callPackage ./tests/after-reset.nix {
       nix = nixVersions.latest;
