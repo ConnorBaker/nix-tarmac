@@ -4,6 +4,7 @@
   newScope,
   fetchFromGitHub,
   nixVersions,
+  re2c,
   symlinkJoin,
 }:
 lib.makeScope newScope (
@@ -23,7 +24,18 @@ lib.makeScope newScope (
     };
     nixGit =
       ((nixVersions.nixComponents_git.overrideSource nixGitSrc).overrideScope (
-        _final: _prev: { inherit (nixGitPin) version; }
+        _final: prev: {
+          inherit (nixGitPin) version;
+          # Nix 15e1eb4b54 (2.37pre) lexes with re2c instead of flex; the
+          # pinned nixpkgs' nix-expr recipe gives it only flex. re2c is
+          # added beside flex, so nix-expr configures whether nix-git.json
+          # is before that commit (flex) or at or after it (re2c). nixpkgs
+          # dfd52640f0b8 picks one by version instead: drop this override
+          # once the nixpkgs input has that.
+          nix-expr = prev.nix-expr.overrideAttrs (old: {
+            nativeBuildInputs = old.nativeBuildInputs ++ [ re2c ];
+          });
+        }
       )).nix-everything;
     nixFor = version: if version == "git" then nixGit else nixVersions.${version};
 
